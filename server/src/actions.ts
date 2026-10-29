@@ -1,4 +1,4 @@
-import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
+import { defineAction, z, type ActionsModule, type Ctx } from "./framework";
 import { asc, eq } from "drizzle-orm";
 import * as schema from "./schema";
 
@@ -66,7 +66,7 @@ const DEFAULT_MENUS: { name: string; price: number; minutes: number }[] = [
   { name: "パーマ", price: 8000, minutes: 120 },
 ];
 
-async function seedIfEmpty(ctx: Ctx) {
+export async function seedIfEmpty(ctx: Ctx) {
   const db = ctx.db<typeof schema>();
   const existing = await db.select().from(schema.shops).limit(1);
   if (existing.length > 0) return;

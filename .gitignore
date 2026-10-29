@@ -1,0 +1,15 @@
+node_modules/
+.bun-cache/
+
+client/dist/
+server/dist/
+
+data/*.db
+data/*.db-journal
+data/*.db-walrus
+data/*.db-shm
+data/*.db-wal
+
+*.tsbuildinfo
+.tsbuildinfo*
+.DS_Store
