@@ -1,5 +1,4 @@
 @import "tailwindcss";
-@import "tailwindcss-safe-area";
 
 @theme {
   --text-xs: 13px;

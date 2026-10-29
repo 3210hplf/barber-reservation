@@ -1,8 +1,0 @@
-{
-  "runtime": "typescript",
-  "platformVersion": 25,
-  "entry": "client/dist/index.html",
-  "name": "床屋の予約管理",
-  "slug": "space-3",
-  "managedCronJobs": []
-}

@@ -1,19 +1,17 @@
 <!doctype html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
     <meta name="color-scheme" content="light dark" />
-    <!-- Empty inline icon: stops the browser fetching /favicon.ico, which
-         lives outside the space's routes and fails auth. -->
     <link rel="icon" href="data:," />
     <title>床屋の予約管理</title>
-    <script src="./src/main.tsx" type="module"></script>
+    <!-- build.mjs copies this file to client/dist/; the bundle and the
+         generated stylesheet live next to it there. -->
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./main.js" type="module"></script>
   </head>
   <body>
-    <div
-      data-generated-space-root=""
-      data-generated-space-slug="space-3"
-    ></div>
+    <div id="root"></div>
   </body>
 </html>

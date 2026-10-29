@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
+import { SafeAreaTopScrim } from "./SafeArea";
 import { api, type ApiResponse } from "./api";
 
 type State = ApiResponse<typeof api, "getState">;
 type Shop = State["shops"][number];
-type Menu = State["menus"][number];
 type Booking = State["bookings"][number];
 type Override = State["overrides"][number];
 
