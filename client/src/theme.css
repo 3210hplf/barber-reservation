@@ -1,0 +1,56 @@
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 13px;
+  --text-xs--line-height: 18px;
+  --text-sm: 15px;
+  --text-sm--line-height: 22px;
+  --text-base: 17px;
+  --text-base--line-height: 26px;
+  --text-lg: 19px;
+  --text-lg--line-height: 28px;
+  --text-xl: 22px;
+  --text-xl--line-height: 30px;
+  --text-2xl: 26px;
+  --text-2xl--line-height: 34px;
+  --text-3xl: 32px;
+  --text-3xl--line-height: 40px;
+  --text-4xl: 38px;
+  --text-4xl--line-height: 44px;
+}
+
+:root {
+  color-scheme: light dark;
+  --bg: #faf7f2;
+  --surface: #fffdf9;
+  --surface-alt: #f1eadf;
+  --text: #23272e;
+  --dim: #5d6470;
+  --border: #ddd3c2;
+  --accent: #1f3350;
+  --accent-text: #ffffff;
+  --red: #b3402f;
+  --green: #2e6b4f;
+  --radius: 14px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface-alt);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --surface: #21242b;
+    --surface-alt: #2a2e37;
+    --text: #f2efe9;
+    --dim: #a7adb8;
+    --border: #3a3f4a;
+    --accent: #7ea4d8;
+    --accent-text: #101623;
+    --red: #e0806f;
+    --green: #6fc493;
+  }
+}
