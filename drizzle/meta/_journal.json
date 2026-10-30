@@ -15,6 +15,13 @@
       "when": 1793281068870,
       "tag": "0002_barber_booking_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1793376000000,
+      "tag": "0003_add_owner_pin_to_shops",
+      "breakpoints": true
     }
   ]
 }

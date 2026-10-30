@@ -6,6 +6,8 @@ import { api, type ApiResponse } from "./api";
 type State = ApiResponse<typeof api, "getState">;
 type Shop = State["shops"][number];
 type Booking = State["bookings"][number];
+// 氏名・電話番号つきの予約（店主認証後／自分の電話番号での検索でのみ取得）
+type FullBooking = ApiResponse<typeof api, "getOwnerBookings">["bookings"][number];
 type Override = State["overrides"][number];
 
 // ---------- date / time helpers ----------
@@ -242,7 +244,13 @@ function BookingFlow({ state, shop }: { state: State; shop: Shop }) {
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [doneId, setDoneId] = useState<number | null>(null);
+  const [doneInfo, setDoneInfo] = useState<{
+    date: string;
+    startTime: string;
+    menuName: string;
+    minutes: number;
+    customerName: string;
+  } | null>(null);
 
   const menus = state.menus.filter((m) => m.shopId === shop.id);
   const status = dayStatus(shop, state.overrides, date);
@@ -278,7 +286,16 @@ function BookingFlow({ state, shop }: { state: State; shop: Shop }) {
       }),
     onSuccess: (res) => {
       if (res.ok) {
-        setDoneId(res.bookingId);
+        // 完了画面は送信した内容そのもので表示する（公開データに氏名は含まれない）
+        if (menu !== null && time !== null) {
+          setDoneInfo({
+            date,
+            startTime: time,
+            menuName: menu.name,
+            minutes: menu.minutes,
+            customerName: name.trim(),
+          });
+        }
         setError(null);
         void queryClient.invalidateQueries({ queryKey: ["state"] });
       } else {
@@ -297,19 +314,17 @@ function BookingFlow({ state, shop }: { state: State; shop: Shop }) {
     digits(phone).length >= 10 &&
     !createMut.isPending;
 
-  if (doneId !== null) {
-    const b = state.bookings.find((x) => x.id === doneId);
+  if (doneInfo !== null) {
+    const b = doneInfo;
     return (
       <section className="rounded-[var(--radius)] border-2 border-[var(--green)] bg-[var(--surface)] p-5 text-center">
         <p className="text-3xl font-bold text-[var(--green)]">予約が完了しました</p>
-        {b ? (
-          <div className="mt-4 space-y-1 text-lg">
-            <p className="font-bold">{shop.name}</p>
-            <p>{fmtDateJP(b.date)} {b.startTime}〜</p>
-            <p>{b.menuName}（{b.minutes}分）</p>
-            <p>{b.customerName} 様</p>
-          </div>
-        ) : null}
+        <div className="mt-4 space-y-1 text-lg">
+          <p className="font-bold">{shop.name}</p>
+          <p>{fmtDateJP(b.date)} {b.startTime}〜</p>
+          <p>{b.menuName}（{b.minutes}分）</p>
+          <p>{b.customerName} 様</p>
+        </div>
         <p className="mt-4 text-base text-[var(--dim)]">
           当日は時間までにご来店ください。変更・キャンセルは下の「自分の予約を確認」からできます。
         </p>
@@ -317,7 +332,7 @@ function BookingFlow({ state, shop }: { state: State; shop: Shop }) {
           type="button"
           className={`${bigBtnCls} mt-5`}
           onClick={() => {
-            setDoneId(null);
+            setDoneInfo(null);
             setTime(null);
             setMenuId(null);
           }}
@@ -486,27 +501,26 @@ function MyBookings({ state }: { state: State }) {
   const queryClient = useQueryClient();
   const [phoneInput, setPhoneInput] = useState("");
   const [searched, setSearched] = useState<string | null>(null);
+  const [mine, setMine] = useState<FullBooking[]>([]);
   const [confirmId, setConfirmId] = useState<number | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
-  const mine =
-    searched === null
-      ? []
-      : state.bookings
-          .filter(
-            (b) =>
-              digits(b.phone) === digits(searched) &&
-              b.status === "booked" &&
-              b.date >= state.today,
-          )
-          .sort((a, b) => (a.date + a.startTime).localeCompare(b.date + b.startTime));
+  // 自分の予約は電話番号をサーバーに送って検索する（全員の予約は端末に渡らない）
+  const searchMut = useMutation({
+    mutationFn: (phone: string) => api.lookupMyBookings({ phone }),
+    onSuccess: (res) => {
+      setMine(res.bookings);
+    },
+    onError: () => setMsg("通信に失敗しました"),
+  });
 
   const cancelMut = useMutation({
-    mutationFn: (b: Booking) => api.cancelBooking({ id: b.id, phone: searched ?? "" }),
-    onSuccess: (res) => {
+    mutationFn: (b: FullBooking) => api.cancelBooking({ id: b.id, phone: searched ?? "" }),
+    onSuccess: (res, b) => {
       if (res.ok) {
         setMsg("予約を取り消しました");
         setConfirmId(null);
+        setMine((prev) => prev.filter((x) => x.id !== b.id));
         void queryClient.invalidateQueries({ queryKey: ["state"] });
       } else {
         setMsg(res.error ?? "取り消せませんでした");
@@ -533,19 +547,21 @@ function MyBookings({ state }: { state: State }) {
         <button
           type="button"
           className="min-h-14 shrink-0 rounded-[var(--radius)] bg-[var(--accent)] px-5 text-xl font-bold text-[var(--accent-text)] disabled:opacity-40"
-          disabled={digits(phoneInput).length < 10}
+          disabled={digits(phoneInput).length < 10 || searchMut.isPending}
           onClick={() => {
             setSearched(phoneInput);
             setMsg(null);
+            setConfirmId(null);
+            searchMut.mutate(phoneInput);
           }}
         >
-          確認
+          {searchMut.isPending ? "検索中…" : "確認"}
         </button>
       </div>
       {msg && <p className="mt-3 text-lg font-bold text-[var(--green)]">{msg}</p>}
       {searched !== null && (
         <div className="mt-4 space-y-3">
-          {mine.length === 0 && (
+          {mine.length === 0 && !searchMut.isPending && (
             <p className="text-lg text-[var(--dim)]">この電話番号の今後の予約はありません。</p>
           )}
           {mine.map((b) => {
@@ -594,7 +610,7 @@ function MyBookings({ state }: { state: State }) {
 
 // ---------- owner: booking list + manual add ----------
 
-function OwnerBookings({ state, shop }: { state: State; shop: Shop }) {
+function OwnerBookings({ state, shop, ownerPin }: { state: State; shop: Shop; ownerPin: string }) {
   const queryClient = useQueryClient();
   const [range, setRange] = useState<"today" | "week">("today");
   const [confirmId, setConfirmId] = useState<number | null>(null);
@@ -613,11 +629,20 @@ function OwnerBookings({ state, shop }: { state: State; shop: Shop }) {
     if (mMenuId === 0 && menus.length > 0) setMMenuId(menus[0]?.id ?? 0);
   }, [menus, mMenuId]);
 
+  // 氏名・電話番号つきの予約一覧は、暗証番号認証後の専用取得でのみ読み込む
+  const ownerBookingsQ = useQuery({
+    queryKey: ["ownerBookings", shop.id],
+    queryFn: () => api.getOwnerBookings({ shopId: shop.id, ownerPin }),
+  });
+  const invalidateAll = () => {
+    void queryClient.invalidateQueries({ queryKey: ["state"] });
+    void queryClient.invalidateQueries({ queryKey: ["ownerBookings", shop.id] });
+  };
+
   const endDate = range === "today" ? state.today : addDays(state.today, 6);
-  const list = state.bookings
+  const list = (ownerBookingsQ.data?.bookings ?? [])
     .filter(
       (b) =>
-        b.shopId === shop.id &&
         b.status === "booked" &&
         b.date >= state.today &&
         b.date <= endDate,
@@ -627,12 +652,19 @@ function OwnerBookings({ state, shop }: { state: State; shop: Shop }) {
   const dates: string[] = [];
   for (const b of list) if (!dates.includes(b.date)) dates.push(b.date);
 
+  const [cancelError, setCancelError] = useState<string | null>(null);
   const cancelMut = useMutation({
-    mutationFn: (id: number) => api.cancelBooking({ id }),
-    onSuccess: () => {
-      setConfirmId(null);
-      void queryClient.invalidateQueries({ queryKey: ["state"] });
+    mutationFn: (id: number) => api.cancelBooking({ id, ownerPin }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setConfirmId(null);
+        setCancelError(null);
+        invalidateAll();
+      } else {
+        setCancelError(res.error ?? "取り消せませんでした");
+      }
     },
+    onError: () => setCancelError("通信に失敗しました"),
   });
 
   const addMut = useMutation({
@@ -651,7 +683,7 @@ function OwnerBookings({ state, shop }: { state: State; shop: Shop }) {
         setMError(null);
         setMName("");
         setMPhone("");
-        void queryClient.invalidateQueries({ queryKey: ["state"] });
+        invalidateAll();
       } else {
         setMError(res.error ?? "追加できませんでした");
         setMMsg(null);
@@ -687,8 +719,21 @@ function OwnerBookings({ state, shop }: { state: State; shop: Shop }) {
           ))}
         </div>
 
+        {cancelError && (
+          <p className="mt-3 rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]">
+            {cancelError}
+          </p>
+        )}
+        {ownerBookingsQ.isPending && (
+          <p className="mt-4 text-center text-lg text-[var(--dim)]">予約を読み込んでいます…</p>
+        )}
+        {ownerBookingsQ.error && (
+          <p className="mt-3 rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]">
+            予約一覧を読み込めませんでした。ロックして入り直してください。
+          </p>
+        )}
         <div className="mt-4 space-y-5">
-          {list.length === 0 && (
+          {list.length === 0 && !ownerBookingsQ.isPending && !ownerBookingsQ.error && (
             <p className="rounded-[var(--radius)] bg-[var(--surface)] p-5 text-center text-lg text-[var(--dim)]">
               {range === "today" ? "今日の予約はまだありません。" : "今週の予約はまだありません。"}
             </p>
@@ -805,7 +850,7 @@ function OwnerBookings({ state, shop }: { state: State; shop: Shop }) {
 
 // ---------- owner: calendar edit ----------
 
-function CalendarEdit({ state, shop }: { state: State; shop: Shop }) {
+function CalendarEdit({ state, shop, ownerPin }: { state: State; shop: Shop; ownerPin: string }) {
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<string>(state.today);
   const [closedWeekdays, setClosedWeekdays] = useState<number[]>(shop.closedWeekdays);
@@ -825,6 +870,7 @@ function CalendarEdit({ state, shop }: { state: State; shop: Shop }) {
     mutationFn: () =>
       api.updateShop({
         id: shop.id,
+        ownerPin,
         name: shop.name,
         address: shop.address,
         phone: shop.phone,
@@ -842,10 +888,15 @@ function CalendarEdit({ state, shop }: { state: State; shop: Shop }) {
     onError: () => setRuleMsg("保存に失敗しました"),
   });
 
+  const [overrideError, setOverrideError] = useState<string | null>(null);
   const overrideMut = useMutation({
     mutationFn: (kind: "closed" | "open" | "clear") =>
-      api.setDayOverride({ shopId: shop.id, date: selected, kind }),
-    onSuccess: invalidate,
+      api.setDayOverride({ shopId: shop.id, ownerPin, date: selected, kind }),
+    onSuccess: () => {
+      setOverrideError(null);
+      invalidate();
+    },
+    onError: () => setOverrideError("保存に失敗しました。もう一度お試しください"),
   });
 
   const selStatus = dayStatus(shop, state.overrides, selected);
@@ -943,6 +994,9 @@ function CalendarEdit({ state, shop }: { state: State; shop: Shop }) {
           <p className="text-xl font-bold">
             {fmtDateJP(selected)}：現在は「{selStatus.label}」
           </p>
+          {overrideError && (
+            <p className="mt-2 text-lg font-bold text-[var(--red)]">{overrideError}</p>
+          )}
           <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
             <button
               type="button"
@@ -977,7 +1031,17 @@ function CalendarEdit({ state, shop }: { state: State; shop: Shop }) {
 
 // ---------- owner: settings ----------
 
-function Settings({ state, shop }: { state: State; shop: Shop }) {
+function Settings({
+  state,
+  shop,
+  ownerPin,
+  onPinChanged,
+}: {
+  state: State;
+  shop: Shop;
+  ownerPin: string;
+  onPinChanged: (shopId: number, newPin: string) => void;
+}) {
   const queryClient = useQueryClient();
   const [name, setName] = useState(shop.name);
   const [address, setAddress] = useState(shop.address);
@@ -987,6 +1051,41 @@ function Settings({ state, shop }: { state: State; shop: Shop }) {
   const [slotMinutes, setSlotMinutes] = useState(shop.slotMinutes);
   const [chairs, setChairs] = useState(shop.chairs);
   const [shopMsg, setShopMsg] = useState<string | null>(null);
+
+  const [curPin, setCurPin] = useState("");
+  const [newPin, setNewPin] = useState("");
+  const [newPin2, setNewPin2] = useState("");
+  const [pinMsg, setPinMsg] = useState<string | null>(null);
+  const [pinError, setPinError] = useState<string | null>(null);
+
+  const changePinMut = useMutation({
+    mutationFn: () =>
+      api.changeOwnerPin({ shopId: shop.id, currentPin: curPin, newPin }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        onPinChanged(shop.id, newPin);
+        setPinMsg("暗証番号を変更しました。次回から新しい暗証番号で入ってください。");
+        setPinError(null);
+        setCurPin("");
+        setNewPin("");
+        setNewPin2("");
+        invalidate();
+      } else {
+        setPinError(res.error ?? "変更できませんでした");
+        setPinMsg(null);
+      }
+    },
+    onError: () => {
+      setPinError("通信に失敗しました。もう一度お試しください");
+      setPinMsg(null);
+    },
+  });
+
+  const pinValid =
+    /^\d{4}$/.test(curPin) &&
+    /^\d{4}$/.test(newPin) &&
+    newPin === newPin2 &&
+    !changePinMut.isPending;
 
   const [editMenuId, setEditMenuId] = useState<number | null>(null);
   const [menuName, setMenuName] = useState("");
@@ -1016,6 +1115,7 @@ function Settings({ state, shop }: { state: State; shop: Shop }) {
     mutationFn: () =>
       api.updateShop({
         id: shop.id,
+        ownerPin,
         name: name.trim(),
         address: address.trim(),
         phone: phone.trim(),
@@ -1038,6 +1138,7 @@ function Settings({ state, shop }: { state: State; shop: Shop }) {
       api.upsertMenu({
         id: editMenuId,
         shopId: shop.id,
+        ownerPin,
         name: menuName.trim(),
         price: menuPrice.trim() === "" ? null : Number(menuPrice),
         minutes: Number(menuMinutes),
@@ -1054,7 +1155,7 @@ function Settings({ state, shop }: { state: State; shop: Shop }) {
   });
 
   const deleteMenuMut = useMutation({
-    mutationFn: (id: number) => api.deleteMenu({ id }),
+    mutationFn: (id: number) => api.deleteMenu({ id, shopId: shop.id, ownerPin }),
     onSuccess: () => {
       setConfirmDeleteMenu(null);
       invalidate();
@@ -1115,6 +1216,75 @@ function Settings({ state, shop }: { state: State; shop: Shop }) {
           <button type="button" className={bigBtnCls} disabled={name.trim().length === 0 || saveShopMut.isPending}
             onClick={() => saveShopMut.mutate()}>
             お店の設定を保存する
+          </button>
+        </div>
+      </section>
+
+      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
+        <h3 className="text-xl font-bold">店主画面の暗証番号</h3>
+        {shop.pinNeedsSetup ? (
+          <p className="mt-2 rounded-[var(--radius)] border-2 border-[var(--red)] bg-[var(--surface-alt)] p-3 text-lg font-bold text-[var(--red)]">
+            暗証番号が未設定です。店主画面の初回設定で設定してください。
+          </p>
+        ) : (
+          <p className="mt-1 text-base text-[var(--dim)]">
+            店主画面に入るときの4桁の暗証番号を変更できます。
+          </p>
+        )}
+        <div className="mt-3 space-y-4">
+          <div>
+            <label htmlFor="pin-cur" className={labelCls}>今の暗証番号（4桁）</label>
+            <input
+              id="pin-cur"
+              className={inputCls}
+              value={curPin}
+              onChange={(e) => setCurPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+              placeholder="数字4桁"
+              inputMode="numeric"
+              type="password"
+              autoComplete="off"
+            />
+          </div>
+          <div>
+            <label htmlFor="pin-new" className={labelCls}>新しい暗証番号（4桁）</label>
+            <input
+              id="pin-new"
+              className={inputCls}
+              value={newPin}
+              onChange={(e) => setNewPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+              placeholder="数字4桁"
+              inputMode="numeric"
+              type="password"
+              autoComplete="off"
+            />
+          </div>
+          <div>
+            <label htmlFor="pin-new2" className={labelCls}>新しい暗証番号（もう一度）</label>
+            <input
+              id="pin-new2"
+              className={inputCls}
+              value={newPin2}
+              onChange={(e) => setNewPin2(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+              placeholder="数字4桁"
+              inputMode="numeric"
+              type="password"
+              autoComplete="off"
+            />
+          </div>
+          {newPin2.length === 4 && newPin !== newPin2 && (
+            <p className="text-lg font-bold text-[var(--red)]">
+              新しい暗証番号が2回で一致していません。
+            </p>
+          )}
+          {pinError && <p className="text-lg font-bold text-[var(--red)]">{pinError}</p>}
+          {pinMsg && <p className="text-lg font-bold text-[var(--green)]">{pinMsg}</p>}
+          <button
+            type="button"
+            className={bigBtnCls}
+            disabled={!pinValid}
+            onClick={() => changePinMut.mutate()}
+          >
+            暗証番号を変更する
           </button>
         </div>
       </section>
@@ -1214,17 +1384,374 @@ function Settings({ state, shop }: { state: State; shop: Shop }) {
   );
 }
 
+// ---------- owner: PIN gate ----------
+
+function PinGate({
+  shop,
+  onSuccess,
+  onBack,
+}: {
+  shop: Shop;
+  onSuccess: (pin: string) => void;
+  onBack: () => void;
+}) {
+  const [pin, setPin] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+
+  const attempt = async (value: string) => {
+    setChecking(true);
+    setError(null);
+    try {
+      const res = await api.verifyOwnerPin({ shopId: shop.id, pin: value });
+      if (res.ok) {
+        onSuccess(value);
+      } else {
+        setError("暗証番号が違います。もう一度入力してください。");
+        setPin("");
+      }
+    } catch {
+      setError("通信に失敗しました。もう一度お試しください。");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const pushDigit = (d: string) => {
+    if (checking || pin.length >= 4) return;
+    const next = pin + d;
+    setPin(next);
+    setError(null);
+    if (next.length === 4) void attempt(next);
+  };
+
+  const handleInput = (value: string) => {
+    const cleaned = value.replace(/[^0-9]/g, "").slice(0, 4);
+    setPin(cleaned);
+    setError(null);
+    if (cleaned.length === 4 && !checking) void attempt(cleaned);
+  };
+
+  return (
+    <section className="mx-auto max-w-md rounded-[var(--radius)] bg-[var(--surface)] p-5 shadow-sm">
+      <h2 className="text-center text-2xl font-bold">店主画面ロック</h2>
+      <p className="mt-2 text-center text-lg">
+        <span className="font-bold">{shop.name}</span> の店主画面です。
+        <br />
+        暗証番号（数字4桁）を入力してください。
+      </p>
+      <div className="mt-5 flex items-center justify-center gap-3" aria-hidden="true">
+        {[0, 1, 2, 3].map((i) => (
+          <span
+            key={i}
+            className={`h-6 w-6 rounded-full border-2 ${
+              pin.length > i
+                ? "border-[var(--accent)] bg-[var(--accent)]"
+                : "border-[var(--border)] bg-[var(--surface)]"
+            }`}
+          />
+        ))}
+      </div>
+      <p className="mt-2 text-center text-base text-[var(--dim)]" role="status">
+        {checking ? "確認しています…" : `${pin.length} / 4 桁入力済み`}
+      </p>
+
+      {error && (
+        <p className="mt-3 rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-center text-lg font-bold text-[var(--red)]" role="alert">
+          {error}
+        </p>
+      )}
+
+      <div className="mt-5 grid grid-cols-3 gap-2">
+        {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((d) => (
+          <button
+            key={d}
+            type="button"
+            aria-label={`数字 ${d}`}
+            disabled={checking}
+            onClick={() => pushDigit(d)}
+            className="min-h-16 rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] text-3xl font-bold text-[var(--text)] disabled:opacity-40"
+          >
+            {d}
+          </button>
+        ))}
+        <button
+          type="button"
+          aria-label="全部消す"
+          disabled={checking || pin.length === 0}
+          onClick={() => setPin("")}
+          className="min-h-16 rounded-[var(--radius)] bg-[var(--surface-alt)] text-lg font-bold text-[var(--text)] disabled:opacity-40"
+        >
+          消す
+        </button>
+        <button
+          type="button"
+          aria-label="数字 0"
+          disabled={checking}
+          onClick={() => pushDigit("0")}
+          className="min-h-16 rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] text-3xl font-bold text-[var(--text)] disabled:opacity-40"
+        >
+          0
+        </button>
+        <button
+          type="button"
+          aria-label="1文字消す"
+          disabled={checking || pin.length === 0}
+          onClick={() => setPin(pin.slice(0, -1))}
+          className="min-h-16 rounded-[var(--radius)] bg-[var(--surface-alt)] text-lg font-bold text-[var(--text)] disabled:opacity-40"
+        >
+          ← 消す
+        </button>
+      </div>
+
+      <div className="mt-5">
+        <label htmlFor="pin-gate-input" className={labelCls}>
+          キーボードで入力する場合
+        </label>
+        <input
+          id="pin-gate-input"
+          className={`${inputCls} text-center text-2xl tracking-[0.5em]`}
+          value={pin}
+          onChange={(e) => handleInput(e.target.value)}
+          placeholder="4桁"
+          inputMode="numeric"
+          type="password"
+          autoComplete="off"
+          maxLength={4}
+        />
+      </div>
+
+      <button
+        type="button"
+        className="mt-6 min-h-14 w-full rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold text-[var(--text)]"
+        onClick={onBack}
+      >
+        お客さん画面に戻る
+      </button>
+    </section>
+  );
+}
+
+// ---------- owner: first-run PIN setup (no default PIN exists) ----------
+
+function SetupPin({
+  shop,
+  onSetup,
+  onBack,
+}: {
+  shop: Shop;
+  onSetup: (newPin: string) => void;
+  onBack: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [newPin, setNewPin] = useState("");
+  const [newPin2, setNewPin2] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const setupMut = useMutation({
+    mutationFn: () => api.setupOwnerPin({ shopId: shop.id, newPin }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        onSetup(newPin);
+        void queryClient.invalidateQueries({ queryKey: ["state"] });
+      } else {
+        setError(res.error ?? "設定できませんでした");
+      }
+    },
+    onError: () => setError("通信に失敗しました。もう一度お試しください"),
+  });
+
+  const valid =
+    /^\d{4}$/.test(newPin) && newPin === newPin2 && !setupMut.isPending;
+
+  return (
+    <section className="mx-auto max-w-md rounded-[var(--radius)] bg-[var(--surface)] p-5 shadow-sm">
+      <h2 className="text-center text-2xl font-bold">暗証番号を決めてください</h2>
+      <p className="mt-2 text-lg">
+        <span className="font-bold">{shop.name}</span> の店主画面には、まだ暗証番号が設定されていません。
+        店主ご本人が、新しい暗証番号（数字4桁）を決めてください。
+        この番号は店主画面に入るたびに必要です。忘れない番号にしてください。
+      </p>
+      <div className="mt-4 space-y-4">
+        <div>
+          <label htmlFor="sup-new" className={labelCls}>新しい暗証番号（4桁）</label>
+          <input
+            id="sup-new"
+            className={inputCls}
+            value={newPin}
+            onChange={(e) => setNewPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+            placeholder="数字4桁"
+            inputMode="numeric"
+            type="password"
+            autoComplete="off"
+          />
+        </div>
+        <div>
+          <label htmlFor="sup-new2" className={labelCls}>新しい暗証番号（もう一度）</label>
+          <input
+            id="sup-new2"
+            className={inputCls}
+            value={newPin2}
+            onChange={(e) => setNewPin2(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+            placeholder="数字4桁"
+            inputMode="numeric"
+            type="password"
+            autoComplete="off"
+          />
+        </div>
+        {newPin2.length === 4 && newPin !== newPin2 && (
+          <p className="text-lg font-bold text-[var(--red)]">
+            暗証番号が2回で一致していません。
+          </p>
+        )}
+        {error && (
+          <p className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]" role="alert">
+            {error}
+          </p>
+        )}
+        <button
+          type="button"
+          className={bigBtnCls}
+          disabled={!valid}
+          onClick={() => setupMut.mutate()}
+        >
+          暗証番号を決めて店主画面へ
+        </button>
+        <button
+          type="button"
+          className="min-h-14 w-full rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold text-[var(--text)]"
+          onClick={onBack}
+        >
+          お客さん画面に戻る
+        </button>
+      </div>
+    </section>
+  );
+}
+
+// ---------- install guide (PWA) ----------
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: string }>;
+}
+
+function InstallGuide() {
+  const [deferred, setDeferred] = useState<BeforeInstallPromptEvent | null>(null);
+  const [installed, setInstalled] = useState(false);
+
+  useEffect(() => {
+    const onPrompt = (e: Event) => {
+      e.preventDefault();
+      setDeferred(e as BeforeInstallPromptEvent);
+    };
+    const onInstalled = () => {
+      setInstalled(true);
+      setDeferred(null);
+    };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onPrompt);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+
+  const standalone =
+    typeof window !== "undefined" &&
+    (window.matchMedia("(display-mode: standalone)").matches ||
+      (window.navigator as unknown as { standalone?: boolean }).standalone === true);
+
+  if (standalone || installed) {
+    return (
+      <section className="mt-5 rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
+        <p className="text-lg font-bold text-[var(--green)]">
+          ホーム画面に追加済みです。このアイコンからいつでも開けます。
+        </p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="mt-5 rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
+      <h2 className="text-xl font-bold">ホーム画面に追加すると便利です</h2>
+      <p className="mt-1 text-base text-[var(--dim)]">
+        追加すると、アプリのように全画面で開けて、次回からアイコンをタップするだけで予約できます。
+      </p>
+      {deferred && (
+        <button
+          type="button"
+          className={`${bigBtnCls} mt-3`}
+          onClick={() => {
+            void deferred.prompt();
+          }}
+        >
+          ホーム画面に追加する
+        </button>
+      )}
+      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        <div className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-3">
+          <p className="text-lg font-bold">iPhone（Safari）</p>
+          <ol className="mt-1 list-decimal space-y-1 pl-5 text-base">
+            <li>下の「共有」ボタン（四角に上矢印）をタップ</li>
+            <li>「ホーム画面に追加」を選ぶ</li>
+            <li>右上の「追加」をタップ</li>
+          </ol>
+        </div>
+        <div className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-3">
+          <p className="text-lg font-bold">Android（Chrome）</p>
+          <ol className="mt-1 list-decimal space-y-1 pl-5 text-base">
+            <li>右上のメニュー（︙）をタップ</li>
+            <li>「ホーム画面に追加」または「アプリをインストール」を選ぶ</li>
+            <li>「追加」をタップ</li>
+          </ol>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 // ---------- root ----------
+
+const OWNER_PIN_STORAGE_KEY = "barber-owner-pins";
+
+function loadOwnerPins(): Record<number, string> {
+  try {
+    const raw = window.sessionStorage.getItem(OWNER_PIN_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return {};
+    const out: Record<number, string> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "string" && /^\d{4}$/.test(v)) out[Number(k)] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
 
 export function App() {
   const stateQ = useQuery({ queryKey: ["state"], queryFn: () => api.getState({}) });
   const [shopId, setShopId] = useState<number | null>(null);
   const [mode, setMode] = useState<"customer" | "owner">("customer");
   const [ownerTab, setOwnerTab] = useState<"bookings" | "calendar" | "settings">("bookings");
+  // 店舗ごとに認証済みの暗証番号（このタブを開いている間だけ保持）
+  const [ownerPins, setOwnerPins] = useState<Record<number, string>>(loadOwnerPins);
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(OWNER_PIN_STORAGE_KEY, JSON.stringify(ownerPins));
+    } catch {
+      // 保存できなくても動作は続ける
+    }
+  }, [ownerPins]);
 
   const state = stateQ.data;
   const shop =
     state?.shops.find((s) => s.id === shopId) ?? state?.shops[0] ?? null;
+  const ownerPin = shop ? ownerPins[shop.id] : undefined;
+  const ownerAuthed = ownerPin !== undefined;
 
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
@@ -1331,9 +1858,46 @@ export function App() {
                 <>
                   <BookingFlow key={`bf-${shop.id}`} state={state} shop={shop} />
                   <MyBookings state={state} />
+                  <InstallGuide />
                 </>
+              ) : shop.pinNeedsSetup ? (
+                <SetupPin
+                  key={`sup-${shop.id}`}
+                  shop={shop}
+                  onSetup={(pin) =>
+                    setOwnerPins((prev) => ({ ...prev, [shop.id]: pin }))
+                  }
+                  onBack={() => setMode("customer")}
+                />
+              ) : !ownerAuthed || ownerPin === undefined ? (
+                <PinGate
+                  key={`pin-${shop.id}`}
+                  shop={shop}
+                  onSuccess={(pin) =>
+                    setOwnerPins((prev) => ({ ...prev, [shop.id]: pin }))
+                  }
+                  onBack={() => setMode("customer")}
+                />
               ) : (
                 <>
+                  <div className="mb-4 flex items-center justify-between gap-3">
+                    <p className="text-lg font-bold">
+                      {shop.name} の店主画面
+                    </p>
+                    <button
+                      type="button"
+                      className="min-h-12 shrink-0 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold"
+                      onClick={() =>
+                        setOwnerPins((prev) => {
+                          const next = { ...prev };
+                          delete next[shop.id];
+                          return next;
+                        })
+                      }
+                    >
+                      ロックする
+                    </button>
+                  </div>
                   <div className="mb-5 grid grid-cols-3 gap-2" role="tablist" aria-label="店主画面の切り替え">
                     {(
                       [
@@ -1359,13 +1923,21 @@ export function App() {
                     ))}
                   </div>
                   {ownerTab === "bookings" && (
-                    <OwnerBookings key={`ob-${shop.id}`} state={state} shop={shop} />
+                    <OwnerBookings key={`ob-${shop.id}`} state={state} shop={shop} ownerPin={ownerPin} />
                   )}
                   {ownerTab === "calendar" && (
-                    <CalendarEdit key={`ce-${shop.id}`} state={state} shop={shop} />
+                    <CalendarEdit key={`ce-${shop.id}`} state={state} shop={shop} ownerPin={ownerPin} />
                   )}
                   {ownerTab === "settings" && (
-                    <Settings key={`st-${shop.id}`} state={state} shop={shop} />
+                    <Settings
+                      key={`st-${shop.id}`}
+                      state={state}
+                      shop={shop}
+                      ownerPin={ownerPin}
+                      onPinChanged={(id, newPin) =>
+                        setOwnerPins((prev) => ({ ...prev, [id]: newPin }))
+                      }
+                    />
                   )}
                 </>
               )}

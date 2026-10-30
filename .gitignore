@@ -13,3 +13,5 @@ data/*.db-wal
 *.tsbuildinfo
 .tsbuildinfo*
 .DS_Store
+
+.wrangler/
