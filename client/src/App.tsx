@@ -1124,7 +1124,8 @@ function Settings({
     /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug.trim()) &&
     slug.trim().length >= 2 &&
     slug.trim().length <= 32 &&
-    slug.trim() !== "owner";
+    slug.trim() !== "owner" &&
+    slug.trim() !== "admin";
   const slugTakenByOther = state.shops.some(
     (s) => s.id !== shop.id && s.slug === slug.trim(),
   );
@@ -1228,7 +1229,7 @@ function Settings({
             </p>
             {slug.trim().length > 0 && !slugValid && (
               <p className="mt-1 text-lg font-bold text-[var(--red)]">
-                スラッグの形式が正しくありません（「owner」は使えません）。
+                スラッグの形式が正しくありません（「owner」「admin」は使えません）。
               </p>
             )}
             {slugValid && slugTakenByOther && (
@@ -1781,18 +1782,22 @@ function InstallGuide({ shop }: { shop: Shop }) {
 //   /             … 店舗入口（各店へのリンク）
 //   /<slug>       … その店舗専用のお客さん用ページ
 //   /<slug>/owner … その店舗専用の店主用ページ
+//   /admin        … 全体管理ページ（どこからもリンクしない）
 // お客さん用ページには店主用ページへの導線を置かない。
 
 type Route =
   | { kind: "entrance" }
   | { kind: "customer"; slug: string }
   | { kind: "owner"; slug: string }
+  | { kind: "admin" }
   | { kind: "unknown"; slug: string };
 
 function parseRoute(): Route {
   const parts = window.location.pathname.split("/").filter((s) => s.length > 0);
   if (parts.length === 0) return { kind: "entrance" };
   const slug = parts[0] ?? "";
+  // 「admin」はスラッグの予約語なので、店舗スラッグと衝突しない
+  if (parts.length === 1 && slug === "admin") return { kind: "admin" };
   if (parts.length === 1) return { kind: "customer", slug };
   if (parts.length === 2 && parts[1] === "owner") return { kind: "owner", slug };
   return { kind: "unknown", slug };
@@ -1838,6 +1843,365 @@ function ShopInfoCard({ shop, showSetupHint = false }: { shop: Shop; showSetupHi
         )}
       </div>
     </div>
+  );
+}
+
+// ---------- admin (全体管理) ----------
+//
+// /admin 専用ページ。入口・お客さん用・店主用のどこにもリンクは置かない。
+// 管理者パスワードはサーバー側でハッシュ保存され、既知の初期パスワードは
+// 無い。未設定の間だけ、最初に開いた管理者本人が設定できる。
+
+const ADMIN_STORAGE_KEY = "barber-admin-password";
+
+function loadAdminPassword(): string | null {
+  try {
+    const v = window.sessionStorage.getItem(ADMIN_STORAGE_KEY);
+    return v && v.length > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function AdminSetup({ onSetup }: { onSetup: (pw: string) => void }) {
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const mut = useMutation({
+    mutationFn: () => api.setupAdminPassword({ newPassword: pw }),
+    onSuccess: (res) => {
+      if (res.ok) onSetup(pw);
+      else setError(res.error ?? "設定できませんでした");
+    },
+    onError: () => setError("通信に失敗しました。もう一度お試しください"),
+  });
+  const valid = pw.length >= 6 && pw === pw2 && !mut.isPending;
+  return (
+    <section className="mx-auto max-w-md rounded-[var(--radius)] bg-[var(--surface)] p-5 shadow-sm">
+      <h2 className="text-center text-2xl font-bold">管理者パスワードを設定</h2>
+      <p className="mt-2 text-base text-[var(--dim)]">
+        このページは全体管理用です。まだ管理者パスワードが設定されていません。管理者ご本人が新しいパスワード（6文字以上）を決めてください。パスワードはハッシュ化して保存され、平文では保存されません。
+      </p>
+      <div className="mt-4 space-y-4">
+        <div>
+          <label htmlFor="admin-setup-pw" className={labelCls}>新しい管理者パスワード（6文字以上）</label>
+          <input id="admin-setup-pw" type="password" className={inputCls} value={pw} onChange={(e) => setPw(e.target.value)} autoComplete="new-password" placeholder="6文字以上" />
+        </div>
+        <div>
+          <label htmlFor="admin-setup-pw2" className={labelCls}>パスワード（もう一度）</label>
+          <input id="admin-setup-pw2" type="password" className={inputCls} value={pw2} onChange={(e) => setPw2(e.target.value)} autoComplete="new-password" placeholder="もう一度入力" />
+        </div>
+        {pw2.length > 0 && pw !== pw2 && <p className="text-lg font-bold text-[var(--red)]">パスワードが一致していません。</p>}
+        {pw.length > 0 && pw.length < 6 && <p className="text-lg font-bold text-[var(--red)]">パスワードは6文字以上にしてください。</p>}
+        {error && <p className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]" role="alert">{error}</p>}
+        <button type="button" className={bigBtnCls} disabled={!valid} onClick={() => mut.mutate()}>
+          {mut.isPending ? "設定しています…" : "パスワードを設定して管理画面へ"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function AdminLogin({ onLogin }: { onLogin: (pw: string) => void }) {
+  const [pw, setPw] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  const attempt = async () => {
+    if (!pw) return;
+    setChecking(true);
+    setError(null);
+    try {
+      const res = await api.verifyAdminPassword({ password: pw });
+      if (res.ok) onLogin(pw);
+      else {
+        setError("パスワードが違います。もう一度入力してください。");
+        setPw("");
+      }
+    } catch {
+      setError("通信に失敗しました。もう一度お試しください。");
+    } finally {
+      setChecking(false);
+    }
+  };
+  return (
+    <section className="mx-auto max-w-md rounded-[var(--radius)] bg-[var(--surface)] p-5 shadow-sm">
+      <h2 className="text-center text-2xl font-bold">管理者ログイン</h2>
+      <p className="mt-2 text-center text-base text-[var(--dim)]">全体管理ページです。管理者パスワードを入力してください。</p>
+      <div className="mt-4 space-y-4">
+        <div>
+          <label htmlFor="admin-login-pw" className={labelCls}>管理者パスワード</label>
+          <input id="admin-login-pw" type="password" className={inputCls} value={pw} onChange={(e) => setPw(e.target.value)} autoComplete="current-password" placeholder="パスワード" onKeyDown={(e) => { if (e.key === "Enter") void attempt(); }} />
+        </div>
+        {error && <p className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]" role="alert">{error}</p>}
+        <button type="button" className={bigBtnCls} disabled={!pw || checking} onClick={() => void attempt()}>
+          {checking ? "確認しています…" : "ログイン"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function AdminShopSlugEditor({ shop, adminPassword }: { shop: Shop; adminPassword: string }) {
+  const queryClient = useQueryClient();
+  const [slug, setSlug] = useState(shop.slug);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => { setSlug(shop.slug); }, [shop.slug]);
+  const slugTrim = slug.trim();
+  const valid = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slugTrim) && slugTrim.length >= 2 && slugTrim.length <= 32 && slugTrim !== "owner" && slugTrim !== "admin";
+  const mut = useMutation({
+    mutationFn: () => api.adminUpdateSlug({ adminPassword, shopId: shop.id, slug: slugTrim }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setMsg("スラッグを変更しました");
+        setError(null);
+        void queryClient.invalidateQueries({ queryKey: ["state"] });
+        void queryClient.invalidateQueries({ queryKey: ["adminShops"] });
+      } else {
+        setError(res.error ?? "変更できませんでした");
+        setMsg(null);
+      }
+    },
+    onError: () => setError("通信に失敗しました"),
+  });
+  return (
+    <div className="mt-3 border-t border-[var(--border)] pt-3">
+      <label htmlFor={`admin-slug-${shop.id}`} className={labelCls}>スラッグを変更</label>
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <input id={`admin-slug-${shop.id}`} className={inputCls} value={slug} onChange={(e) => setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))} autoComplete="off" autoCapitalize="none" spellCheck={false} placeholder="例：shop1" aria-label={`${shop.name}のスラッグ`} />
+        <button type="button" className="min-h-14 shrink-0 rounded-[var(--radius)] bg-[var(--accent)] px-5 text-lg font-bold text-[var(--accent-text)] disabled:opacity-40" disabled={!valid || slugTrim === shop.slug || mut.isPending} onClick={() => mut.mutate()}>
+          {mut.isPending ? "保存中…" : "スラッグを保存"}
+        </button>
+      </div>
+      <p className="mt-1 text-sm text-[var(--dim)]">英小文字・数字・ハイフンで2〜32文字。他店と重複不可、「owner」「admin」は使用不可。変更すると古いURLは使えなくなります。</p>
+      {!valid && slugTrim.length > 0 && <p className="mt-1 text-base font-bold text-[var(--red)]">スラッグの形式が正しくありません。</p>}
+      {error && <p className="mt-1 text-base font-bold text-[var(--red)]">{error}</p>}
+      {msg && <p className="mt-1 text-base font-bold text-[var(--green)]">{msg}</p>}
+    </div>
+  );
+}
+
+function AdminDashboard({ adminPassword, onLogout, onPasswordChanged }: { adminPassword: string; onLogout: () => void; onPasswordChanged: (newPw: string) => void }) {
+  const queryClient = useQueryClient();
+  const shopsQ = useQuery({ queryKey: ["adminShops"], queryFn: () => api.adminListShops({ adminPassword }) });
+  const shops = shopsQ.data?.shops ?? [];
+
+  const [newName, setNewName] = useState("");
+  const [newSlug, setNewSlug] = useState("");
+  const [newAddress, setNewAddress] = useState("");
+  const [newPhone, setNewPhone] = useState("");
+  const [createMsg, setCreateMsg] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  const newSlugTrim = newSlug.trim();
+  const newSlugValid = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(newSlugTrim) && newSlugTrim.length >= 2 && newSlugTrim.length <= 32 && newSlugTrim !== "owner" && newSlugTrim !== "admin";
+  const slugTaken = shops.some((s) => s.slug === newSlugTrim);
+
+  const createMut = useMutation({
+    mutationFn: () => api.adminCreateShop({ adminPassword, name: newName.trim(), slug: newSlugTrim, address: newAddress.trim(), phone: newPhone.trim() }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setCreateMsg(`店舗「${newName.trim()}」を追加しました（スラッグ：${newSlugTrim}）`);
+        setCreateError(null);
+        setNewName("");
+        setNewSlug("");
+        setNewAddress("");
+        setNewPhone("");
+        void queryClient.invalidateQueries({ queryKey: ["state"] });
+        void queryClient.invalidateQueries({ queryKey: ["adminShops"] });
+      } else {
+        setCreateError(res.error ?? "作成できませんでした");
+        setCreateMsg(null);
+      }
+    },
+    onError: () => setCreateError("通信に失敗しました"),
+  });
+
+  const [curPw, setCurPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [newPw2, setNewPw2] = useState("");
+  const [pwMsg, setPwMsg] = useState<string | null>(null);
+  const [pwError, setPwError] = useState<string | null>(null);
+  const changePwMut = useMutation({
+    mutationFn: () => api.changeAdminPassword({ currentPassword: curPw, newPassword: newPw }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        onPasswordChanged(newPw);
+        setPwMsg("管理者パスワードを変更しました。次回から新しいパスワードでログインしてください。");
+        setPwError(null);
+        setCurPw("");
+        setNewPw("");
+        setNewPw2("");
+      } else {
+        setPwError(res.error ?? "変更できませんでした");
+        setPwMsg(null);
+      }
+    },
+    onError: () => setPwError("通信に失敗しました"),
+  });
+  const pwValid = curPw.length > 0 && newPw.length >= 6 && newPw === newPw2 && !changePwMut.isPending;
+
+  return (
+    <div className="space-y-8 pt-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="text-3xl font-bold">全体管理（admin）</h1>
+          <p className="mt-1 text-base text-[var(--dim)]">店舗の追加とスラッグ管理を行います。店舗の削除はできません。</p>
+        </div>
+        <button type="button" className="min-h-12 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold" onClick={onLogout} aria-label="管理者ログアウト">
+          ログアウト
+        </button>
+      </div>
+
+      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
+        <h2 className="text-2xl font-bold">店舗一覧</h2>
+        {shopsQ.isPending && <p className="mt-3 text-lg text-[var(--dim)]">読み込んでいます…</p>}
+        {shopsQ.error && <p className="mt-3 text-lg font-bold text-[var(--red)]">店舗一覧を読み込めませんでした。ログアウトして入り直してください。</p>}
+        <div className="mt-4 space-y-4">
+          {shops.map((s) => (
+            <article key={s.id} className="rounded-[var(--radius)] border-2 border-[var(--border)] p-4" aria-label={`${s.name}の情報`}>
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <h3 className="text-2xl font-bold">{s.name}</h3>
+                <span className={`rounded-full px-3 py-1 text-sm font-bold ${s.pinNeedsSetup ? "bg-[var(--surface-alt)] text-[var(--red)]" : "bg-[var(--surface-alt)] text-[var(--green)]"}`}>
+                  店主暗証番号：{s.pinNeedsSetup ? "未設定" : "設定済み"}
+                </span>
+              </div>
+              <dl className="mt-3 space-y-2 text-base">
+                <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">スラッグ</dt><dd className="font-mono">{s.slug}</dd></div>
+                <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">お客さん用URL</dt><dd className="break-all font-mono">/{s.slug}</dd></div>
+                <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">店主用URL</dt><dd className="break-all font-mono">/{s.slug}/owner</dd></div>
+                <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">営業時間</dt><dd>{s.openTime}〜{s.closeTime}／枠{s.slotMinutes}分／椅子{s.chairs}台</dd></div>
+                {s.address && <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">住所</dt><dd>{s.address}</dd></div>}
+                {s.phone && <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">電話</dt><dd>{s.phone}</dd></div>}
+              </dl>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <a href={`/${s.slug}`} className="min-h-11 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 py-2 text-base font-bold" aria-label={`${s.name}のお客さん用ページを開く`}>お客さん用を開く</a>
+                <a href={`/${s.slug}/owner`} className="min-h-11 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 py-2 text-base font-bold" aria-label={`${s.name}の店主用ページを開く`}>店主用を開く</a>
+              </div>
+              <AdminShopSlugEditor shop={s} adminPassword={adminPassword} />
+            </article>
+          ))}
+          {!shopsQ.isPending && shops.length === 0 && <p className="text-lg text-[var(--dim)]">店舗がありません。下のフォームから追加できます。</p>}
+        </div>
+      </section>
+
+      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
+        <h2 className="text-2xl font-bold">店舗を追加</h2>
+        <p className="mt-1 text-base text-[var(--dim)]">店名とスラッグが必須です。初期設定は営業時間09:00–19:00、枠30分、椅子1台、定休日は月曜＋第2・第3火曜、デフォルトメニュー6種が入ります。店主暗証番号は未設定で作られ、店主本人が後で初回設定します。</p>
+        <div className="mt-4 space-y-4">
+          <div>
+            <label htmlFor="admin-new-name" className={labelCls}>店名（必須）</label>
+            <input id="admin-new-name" className={inputCls} value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="例：○○理容室" />
+          </div>
+          <div>
+            <label htmlFor="admin-new-slug" className={labelCls}>スラッグ（必須）</label>
+            <input id="admin-new-slug" className={inputCls} value={newSlug} onChange={(e) => setNewSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))} placeholder="例：shop3" autoComplete="off" autoCapitalize="none" spellCheck={false} />
+            <p className="mt-1 text-sm text-[var(--dim)]">お客さん用：/{newSlugTrim || "…"} ／ 店主用：/{newSlugTrim || "…"}/owner</p>
+            {newSlugTrim.length > 0 && !newSlugValid && <p className="mt-1 text-base font-bold text-[var(--red)]">スラッグの形式が正しくありません（「owner」「admin」は使えません）。</p>}
+            {newSlugValid && slugTaken && <p className="mt-1 text-base font-bold text-[var(--red)]">このスラッグは既に使われています。</p>}
+          </div>
+          <div>
+            <label htmlFor="admin-new-address" className={labelCls}>住所（任意）</label>
+            <input id="admin-new-address" className={inputCls} value={newAddress} onChange={(e) => setNewAddress(e.target.value)} placeholder="例：東京都○○区…" />
+          </div>
+          <div>
+            <label htmlFor="admin-new-phone" className={labelCls}>電話番号（任意）</label>
+            <input id="admin-new-phone" className={inputCls} value={newPhone} onChange={(e) => setNewPhone(e.target.value)} placeholder="例：03-1234-5678" inputMode="tel" />
+          </div>
+          {createError && <p className="text-lg font-bold text-[var(--red)]" role="alert">{createError}</p>}
+          {createMsg && <p className="text-lg font-bold text-[var(--green)]" role="status">{createMsg}</p>}
+          <button type="button" className={bigBtnCls} disabled={newName.trim().length === 0 || !newSlugValid || slugTaken || createMut.isPending} onClick={() => createMut.mutate()}>
+            {createMut.isPending ? "追加しています…" : "店舗を追加する"}
+          </button>
+        </div>
+      </section>
+
+      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
+        <h2 className="text-2xl font-bold">管理者パスワードの変更</h2>
+        <p className="mt-1 text-base text-[var(--dim)]">変更には今のパスワードの照合が必要です。パスワードはハッシュ化して保存されます。</p>
+        <div className="mt-4 space-y-4">
+          <div>
+            <label htmlFor="admin-pw-cur" className={labelCls}>今のパスワード</label>
+            <input id="admin-pw-cur" type="password" className={inputCls} value={curPw} onChange={(e) => setCurPw(e.target.value)} autoComplete="current-password" />
+          </div>
+          <div>
+            <label htmlFor="admin-pw-new" className={labelCls}>新しいパスワード（6文字以上）</label>
+            <input id="admin-pw-new" type="password" className={inputCls} value={newPw} onChange={(e) => setNewPw(e.target.value)} autoComplete="new-password" />
+          </div>
+          <div>
+            <label htmlFor="admin-pw-new2" className={labelCls}>新しいパスワード（もう一度）</label>
+            <input id="admin-pw-new2" type="password" className={inputCls} value={newPw2} onChange={(e) => setNewPw2(e.target.value)} autoComplete="new-password" />
+          </div>
+          {newPw2.length > 0 && newPw !== newPw2 && <p className="text-lg font-bold text-[var(--red)]">新しいパスワードが一致していません。</p>}
+          {newPw.length > 0 && newPw.length < 6 && <p className="text-lg font-bold text-[var(--red)]">新しいパスワードは6文字以上にしてください。</p>}
+          {pwError && <p className="text-lg font-bold text-[var(--red)]">{pwError}</p>}
+          {pwMsg && <p className="text-lg font-bold text-[var(--green)]">{pwMsg}</p>}
+          <button type="button" className={bigBtnCls} disabled={!pwValid} onClick={() => changePwMut.mutate()}>
+            パスワードを変更する
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function AdminPage() {
+  const statusQ = useQuery({ queryKey: ["adminStatus"], queryFn: () => api.getAdminStatus({}) });
+  const [adminPassword, setAdminPassword] = useState<string | null>(() => loadAdminPassword());
+  const [verified, setVerified] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    try {
+      if (adminPassword) window.sessionStorage.setItem(ADMIN_STORAGE_KEY, adminPassword);
+      else window.sessionStorage.removeItem(ADMIN_STORAGE_KEY);
+    } catch { /* 保存できなくても動作は続ける */ }
+  }, [adminPassword]);
+
+  useEffect(() => {
+    if (!adminPassword) { setVerified(null); return; }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await api.verifyAdminPassword({ password: adminPassword });
+        if (!cancelled) {
+          setVerified(res.ok);
+          if (!res.ok) setAdminPassword(null);
+        }
+      } catch {
+        if (!cancelled) setVerified(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [adminPassword]);
+
+  if (statusQ.isPending) return <p className="py-16 text-center text-xl">読み込んでいます…</p>;
+  if (statusQ.error) return <p className="py-16 text-center text-xl font-bold text-[var(--red)]">読み込みに失敗しました</p>;
+  const needsSetup = statusQ.data?.needsSetup ?? false;
+
+  if (needsSetup) {
+    return (
+      <div className="pt-6">
+        <AdminSetup onSetup={(pw) => { setAdminPassword(pw); setVerified(true); }} />
+      </div>
+    );
+  }
+
+  if (!adminPassword || verified === false) {
+    return (
+      <div className="pt-6">
+        <AdminLogin onLogin={(pw) => { setAdminPassword(pw); setVerified(true); }} />
+      </div>
+    );
+  }
+
+  if (verified === null) return <p className="py-16 text-center text-xl">確認しています…</p>;
+
+  return (
+    <AdminDashboard
+      adminPassword={adminPassword}
+      onLogout={() => { setAdminPassword(null); setVerified(null); }}
+      onPasswordChanged={(newPw) => setAdminPassword(newPw)}
+    />
   );
 }
 
@@ -1887,6 +2251,19 @@ export function App() {
       : null;
   const ownerPin = shop ? ownerPins[shop.id] : undefined;
   const ownerAuthed = ownerPin !== undefined;
+
+  // 全体管理ページ（/admin）は店舗の状態に依存しない専用画面。
+  // 入口・お客さん用・店主用のどこにもリンクは置いていない。
+  if (route.kind === "admin") {
+    return (
+      <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
+        <SafeAreaTopScrim backgroundColor="var(--bg)" />
+        <main className="mx-auto w-full max-w-2xl px-4 pb-16">
+          <AdminPage />
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
