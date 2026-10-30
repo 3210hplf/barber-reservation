@@ -497,7 +497,7 @@ function BookingFlow({ state, shop }: { state: State; shop: Shop }) {
 
 // ---------- customer: my bookings ----------
 
-function MyBookings({ state }: { state: State }) {
+function MyBookings({ shop }: { shop: Shop }) {
   const queryClient = useQueryClient();
   const [phoneInput, setPhoneInput] = useState("");
   const [searched, setSearched] = useState<string | null>(null);
@@ -505,9 +505,10 @@ function MyBookings({ state }: { state: State }) {
   const [confirmId, setConfirmId] = useState<number | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
-  // 自分の予約は電話番号をサーバーに送って検索する（全員の予約は端末に渡らない）
+  // 自分の予約は電話番号をサーバーに送って、この店舗の範囲だけで検索する
+  // （全員の予約は端末に渡らない）
   const searchMut = useMutation({
-    mutationFn: (phone: string) => api.lookupMyBookings({ phone }),
+    mutationFn: (phone: string) => api.lookupMyBookings({ shopId: shop.id, phone }),
     onSuccess: (res) => {
       setMine(res.bookings);
     },
@@ -562,13 +563,11 @@ function MyBookings({ state }: { state: State }) {
       {searched !== null && (
         <div className="mt-4 space-y-3">
           {mine.length === 0 && !searchMut.isPending && (
-            <p className="text-lg text-[var(--dim)]">この電話番号の今後の予約はありません。</p>
+            <p className="text-lg text-[var(--dim)]">この電話番号の今後の予約は、{shop.name}にはありません。</p>
           )}
           {mine.map((b) => {
-            const shop = state.shops.find((s) => s.id === b.shopId);
             return (
               <div key={b.id} className="rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] p-4">
-                <p className="text-xl font-bold">{shop?.name ?? ""}</p>
                 <p className="mt-1 text-lg">
                   {fmtDateJP(b.date)} {b.startTime}〜{toHHMM(toMin(b.startTime) + b.minutes)}
                 </p>
@@ -871,6 +870,7 @@ function CalendarEdit({ state, shop, ownerPin }: { state: State; shop: Shop; own
       api.updateShop({
         id: shop.id,
         ownerPin,
+        slug: shop.slug,
         name: shop.name,
         address: shop.address,
         phone: shop.phone,
@@ -881,9 +881,13 @@ function CalendarEdit({ state, shop, ownerPin }: { state: State; shop: Shop; own
         closedWeekdays,
         nthClosures,
       }),
-    onSuccess: () => {
-      setRuleMsg("定休日を保存しました");
-      invalidate();
+    onSuccess: (res) => {
+      if (res.ok) {
+        setRuleMsg("定休日を保存しました");
+        invalidate();
+      } else {
+        setRuleMsg(res.error ?? "保存に失敗しました");
+      }
     },
     onError: () => setRuleMsg("保存に失敗しました"),
   });
@@ -1036,13 +1040,16 @@ function Settings({
   shop,
   ownerPin,
   onPinChanged,
+  onSlugChanged,
 }: {
   state: State;
   shop: Shop;
   ownerPin: string;
   onPinChanged: (shopId: number, newPin: string) => void;
+  onSlugChanged: (newSlug: string) => void;
 }) {
   const queryClient = useQueryClient();
+  const [slug, setSlug] = useState(shop.slug);
   const [name, setName] = useState(shop.name);
   const [address, setAddress] = useState(shop.address);
   const [phone, setPhone] = useState(shop.phone);
@@ -1051,6 +1058,7 @@ function Settings({
   const [slotMinutes, setSlotMinutes] = useState(shop.slotMinutes);
   const [chairs, setChairs] = useState(shop.chairs);
   const [shopMsg, setShopMsg] = useState<string | null>(null);
+  const [shopError, setShopError] = useState<string | null>(null);
 
   const [curPin, setCurPin] = useState("");
   const [newPin, setNewPin] = useState("");
@@ -1095,6 +1103,7 @@ function Settings({
   const [confirmDeleteMenu, setConfirmDeleteMenu] = useState<number | null>(null);
 
   useEffect(() => {
+    setSlug(shop.slug);
     setName(shop.name);
     setAddress(shop.address);
     setPhone(shop.phone);
@@ -1111,11 +1120,21 @@ function Settings({
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ["state"] });
   const menus = state.menus.filter((m) => m.shopId === shop.id);
 
+  const slugValid =
+    /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug.trim()) &&
+    slug.trim().length >= 2 &&
+    slug.trim().length <= 32 &&
+    slug.trim() !== "owner";
+  const slugTakenByOther = state.shops.some(
+    (s) => s.id !== shop.id && s.slug === slug.trim(),
+  );
+
   const saveShopMut = useMutation({
     mutationFn: () =>
       api.updateShop({
         id: shop.id,
         ownerPin,
+        slug: slug.trim(),
         name: name.trim(),
         address: address.trim(),
         phone: phone.trim(),
@@ -1126,11 +1145,21 @@ function Settings({
         closedWeekdays: shop.closedWeekdays,
         nthClosures: shop.nthClosures,
       }),
-    onSuccess: () => {
-      setShopMsg("お店の設定を保存しました");
-      invalidate();
+    onSuccess: (res) => {
+      if (res.ok) {
+        setShopMsg("お店の設定を保存しました");
+        setShopError(null);
+        invalidate();
+        if (slug.trim() !== shop.slug) onSlugChanged(slug.trim());
+      } else {
+        setShopError(res.error ?? "保存に失敗しました");
+        setShopMsg(null);
+      }
     },
-    onError: () => setShopMsg("保存に失敗しました"),
+    onError: () => {
+      setShopError("保存に失敗しました");
+      setShopMsg(null);
+    },
   });
 
   const saveMenuMut = useMutation({
@@ -1177,6 +1206,38 @@ function Settings({
             <input id="st-name" className={inputCls} value={name} onChange={(e) => setName(e.target.value)} />
           </div>
           <div>
+            <label htmlFor="st-slug" className={labelCls}>URL用スラッグ（このお店専用URL）</label>
+            <input
+              id="st-slug"
+              className={inputCls}
+              value={slug}
+              onChange={(e) => setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))}
+              placeholder="例：shop1"
+              autoComplete="off"
+              autoCapitalize="none"
+              spellCheck={false}
+            />
+            <p className="mt-1 text-base text-[var(--dim)]">
+              英小文字・数字・ハイフンで2〜32文字。他のお店と重複できません。
+              変えると古いURL（店内QRコードなど）は使えなくなります。
+            </p>
+            <p className="mt-1 text-base">
+              お客さん用：<span className="font-bold">/{slug.trim() || "…"}</span>
+              <br />
+              店主用：<span className="font-bold">/{slug.trim() || "…"}/owner</span>
+            </p>
+            {slug.trim().length > 0 && !slugValid && (
+              <p className="mt-1 text-lg font-bold text-[var(--red)]">
+                スラッグの形式が正しくありません（「owner」は使えません）。
+              </p>
+            )}
+            {slugValid && slugTakenByOther && (
+              <p className="mt-1 text-lg font-bold text-[var(--red)]">
+                このスラッグは他のお店で使われています。
+              </p>
+            )}
+          </div>
+          <div>
             <label htmlFor="st-address" className={labelCls}>住所</label>
             <input id="st-address" className={inputCls} value={address} onChange={(e) => setAddress(e.target.value)} placeholder="例：東京都○○区…" />
           </div>
@@ -1212,8 +1273,9 @@ function Settings({
               </select>
             </div>
           </div>
+          {shopError && <p className="text-lg font-bold text-[var(--red)]">{shopError}</p>}
           {shopMsg && <p className="text-lg font-bold text-[var(--green)]">{shopMsg}</p>}
-          <button type="button" className={bigBtnCls} disabled={name.trim().length === 0 || saveShopMut.isPending}
+          <button type="button" className={bigBtnCls} disabled={name.trim().length === 0 || !slugValid || slugTakenByOther || saveShopMut.isPending}
             onClick={() => saveShopMut.mutate()}>
             お店の設定を保存する
           </button>
@@ -1636,7 +1698,7 @@ interface BeforeInstallPromptEvent extends Event {
   userChoice: Promise<{ outcome: string }>;
 }
 
-function InstallGuide() {
+function InstallGuide({ shop }: { shop: Shop }) {
   const [deferred, setDeferred] = useState<BeforeInstallPromptEvent | null>(null);
   const [installed, setInstalled] = useState(false);
 
@@ -1666,7 +1728,7 @@ function InstallGuide() {
     return (
       <section className="mt-5 rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
         <p className="text-lg font-bold text-[var(--green)]">
-          ホーム画面に追加済みです。このアイコンからいつでも開けます。
+          {shop.name}のページはホーム画面に追加済みです。このアイコンからいつでも開けます。
         </p>
       </section>
     );
@@ -1676,7 +1738,8 @@ function InstallGuide() {
     <section className="mt-5 rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
       <h2 className="text-xl font-bold">ホーム画面に追加すると便利です</h2>
       <p className="mt-1 text-base text-[var(--dim)]">
-        追加すると、アプリのように全画面で開けて、次回からアイコンをタップするだけで予約できます。
+        このページは{shop.name}専用の予約ページです。このまま追加すると、次回からアイコンをタップするだけで
+        {shop.name}の予約ができます（店内のQRコードもこのお店専用URLから作られています）。
       </p>
       {deferred && (
         <button
@@ -1711,6 +1774,73 @@ function InstallGuide() {
   );
 }
 
+// ---------- path routing ----------
+//
+// 店舗別URLは実パス形式で実現する（Bun サーバー / Workers Static Assets
+// ともに SPA フォールバックが効くため、どのパスでも index.html が返る）。
+//   /             … 店舗入口（各店へのリンク）
+//   /<slug>       … その店舗専用のお客さん用ページ
+//   /<slug>/owner … その店舗専用の店主用ページ
+// お客さん用ページには店主用ページへの導線を置かない。
+
+type Route =
+  | { kind: "entrance" }
+  | { kind: "customer"; slug: string }
+  | { kind: "owner"; slug: string }
+  | { kind: "unknown"; slug: string };
+
+function parseRoute(): Route {
+  const parts = window.location.pathname.split("/").filter((s) => s.length > 0);
+  if (parts.length === 0) return { kind: "entrance" };
+  const slug = parts[0] ?? "";
+  if (parts.length === 1) return { kind: "customer", slug };
+  if (parts.length === 2 && parts[1] === "owner") return { kind: "owner", slug };
+  return { kind: "unknown", slug };
+}
+
+function useRoute(): Route {
+  const [route, setRoute] = useState<Route>(() => parseRoute());
+  useEffect(() => {
+    const onChange = () => setRoute(parseRoute());
+    window.addEventListener("popstate", onChange);
+    return () => window.removeEventListener("popstate", onChange);
+  }, []);
+  return route;
+}
+
+function navigateTo(path: string) {
+  window.history.pushState(null, "", path);
+  window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+function ShopInfoCard({ shop, showSetupHint = false }: { shop: Shop; showSetupHint?: boolean }) {
+  return (
+    <div className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
+      <h1 className="text-3xl font-bold">{shop.name}</h1>
+      <div className="mt-2 space-y-1 text-lg">
+        <p>
+          営業時間：{shop.openTime}〜{shop.closeTime}
+        </p>
+        <p>定休日：{closedSummary(shop)}</p>
+        {shop.address && <p>住所：{shop.address}</p>}
+        {shop.phone && (
+          <p>
+            電話：
+            <a href={`tel:${digits(shop.phone)}`} className="font-bold text-[var(--accent)] underline">
+              {shop.phone}
+            </a>
+          </p>
+        )}
+        {showSetupHint && !shop.address && !shop.phone && (
+          <p className="text-base text-[var(--dim)]">
+            住所・電話番号は店主画面の「設定」から登録できます。
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ---------- root ----------
 
 const OWNER_PIN_STORAGE_KEY = "barber-owner-pins";
@@ -1733,8 +1863,7 @@ function loadOwnerPins(): Record<number, string> {
 
 export function App() {
   const stateQ = useQuery({ queryKey: ["state"], queryFn: () => api.getState({}) });
-  const [shopId, setShopId] = useState<number | null>(null);
-  const [mode, setMode] = useState<"customer" | "owner">("customer");
+  const route = useRoute();
   const [ownerTab, setOwnerTab] = useState<"bookings" | "calendar" | "settings">("bookings");
   // 店舗ごとに認証済みの暗証番号（このタブを開いている間だけ保持）
   const [ownerPins, setOwnerPins] = useState<Record<number, string>>(loadOwnerPins);
@@ -1748,8 +1877,14 @@ export function App() {
   }, [ownerPins]);
 
   const state = stateQ.data;
+  const routeSlug =
+    route.kind === "customer" || route.kind === "owner" || route.kind === "unknown"
+      ? route.slug
+      : null;
   const shop =
-    state?.shops.find((s) => s.id === shopId) ?? state?.shops[0] ?? null;
+    state && routeSlug !== null
+      ? (state.shops.find((s) => s.slug === routeSlug) ?? null)
+      : null;
   const ownerPin = shop ? ownerPins[shop.id] : undefined;
   const ownerAuthed = ownerPin !== undefined;
 
@@ -1773,101 +1908,92 @@ export function App() {
           </div>
         )}
 
-        {state && shop && (
-          <>
-            {/* shop switcher */}
-            <div className="pt-4">
-              <div className="grid grid-cols-2 gap-2" role="tablist" aria-label="お店の切り替え">
-                {state.shops.map((s) => {
-                  const active = s.id === shop.id;
-                  return (
-                    <button
-                      key={s.id}
-                      type="button"
-                      role="tab"
-                      aria-selected={active}
-                      onClick={() => setShopId(s.id)}
-                      className={`min-h-16 rounded-[var(--radius)] border-b-8 px-3 py-2 text-xl font-bold ${
-                        active
-                          ? "border-[var(--red)] bg-[var(--accent)] text-[var(--accent-text)]"
-                          : "border-[var(--border)] bg-[var(--surface)] text-[var(--text)]"
-                      }`}
-                    >
-                      {s.name}
-                    </button>
-                  );
-                })}
-              </div>
-              <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-                <h1 className="text-3xl font-bold">{shop.name}</h1>
-                <div className="mt-2 space-y-1 text-lg">
-                  <p>
-                    営業時間：{shop.openTime}〜{shop.closeTime}
-                  </p>
-                  <p>定休日：{closedSummary(shop)}</p>
-                  {shop.address && <p>住所：{shop.address}</p>}
-                  {shop.phone && (
+        {state && route.kind === "entrance" && (
+          <div className="pt-6">
+            <h1 className="text-3xl font-bold">お店を選んでください</h1>
+            <p className="mt-2 text-lg text-[var(--dim)]">
+              ご予約のお店をタップすると、そのお店専用の予約ページが開きます。
+            </p>
+            <div className="mt-5 space-y-4">
+              {state.shops.map((s) => (
+                <a
+                  key={s.id}
+                  href={`/${s.slug}`}
+                  className="block rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] p-5 shadow-sm"
+                  aria-label={`${s.name}の予約ページを開く`}
+                >
+                  <p className="text-3xl font-bold">{s.name}</p>
+                  <div className="mt-2 space-y-1 text-lg">
                     <p>
-                      電話：
-                      <a href={`tel:${digits(shop.phone)}`} className="font-bold text-[var(--accent)] underline">
-                        {shop.phone}
-                      </a>
+                      営業時間：{s.openTime}〜{s.closeTime}
                     </p>
-                  )}
-                  {!shop.address && !shop.phone && (
-                    <p className="text-base text-[var(--dim)]">
-                      住所・電話番号は店主画面の「設定」から登録できます。
-                    </p>
-                  )}
-                </div>
-              </div>
+                    <p>定休日：{closedSummary(s)}</p>
+                    {s.address && <p>住所：{s.address}</p>}
+                    {s.phone && <p>電話：{s.phone}</p>}
+                  </div>
+                  <p className="mt-4 min-h-14 rounded-[var(--radius)] bg-[var(--accent)] px-4 py-3 text-center text-xl font-bold text-[var(--accent-text)]">
+                    このお店で予約する
+                  </p>
+                </a>
+              ))}
+              {state.shops.length === 0 && (
+                <p className="text-lg text-[var(--dim)]">お店が登録されていません。</p>
+              )}
             </div>
+            <p className="mt-6 text-base text-[var(--dim)]">
+              ホーム画面への追加は、各お店の予約ページを開いてから行ってください。お店ごとに専用のページがあります。
+            </p>
+          </div>
+        )}
 
-            {/* mode switch */}
-            <div className="mt-5 grid grid-cols-2 gap-2" role="tablist" aria-label="画面の切り替え">
-              <button
-                type="button"
-                role="tab"
-                aria-selected={mode === "customer"}
-                onClick={() => setMode("customer")}
-                className={`min-h-14 rounded-full text-xl font-bold ${
-                  mode === "customer"
-                    ? "bg-[var(--red)] text-white"
-                    : "bg-[var(--surface-alt)] text-[var(--text)]"
-                }`}
-              >
-                予約する・確認
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={mode === "owner"}
-                onClick={() => setMode("owner")}
-                className={`min-h-14 rounded-full text-xl font-bold ${
-                  mode === "owner"
-                    ? "bg-[var(--red)] text-white"
-                    : "bg-[var(--surface-alt)] text-[var(--text)]"
-                }`}
-              >
-                店主画面
-              </button>
+        {state && route.kind !== "entrance" && shop === null && (
+          <div className="py-16 text-center">
+            <p className="text-2xl font-bold">そのURLのお店は見つかりませんでした</p>
+            <p className="mt-3 text-lg text-[var(--dim)]">
+              URLが変わっているか、入力が間違っている可能性があります。下のボタンからお店を選び直してください。
+            </p>
+            <a
+              href="/"
+              className={`${bigBtnCls} mt-6 block py-3 text-center`}
+              aria-label="店舗入口ページへ移動する"
+            >
+              店舗入口へ
+            </a>
+          </div>
+        )}
+
+        {state && shop && route.kind === "customer" && (
+          <>
+            <div className="pt-4">
+              <ShopInfoCard shop={shop} />
             </div>
-
             <div className="mt-6">
-              {mode === "customer" ? (
-                <>
-                  <BookingFlow key={`bf-${shop.id}`} state={state} shop={shop} />
-                  <MyBookings state={state} />
-                  <InstallGuide />
-                </>
-              ) : shop.pinNeedsSetup ? (
+              <BookingFlow key={`bf-${shop.id}`} state={state} shop={shop} />
+              <MyBookings key={`mb-${shop.id}`} shop={shop} />
+              <InstallGuide shop={shop} />
+            </div>
+            <p className="mt-8 text-center">
+              <a href="/" className="text-base font-bold text-[var(--accent)] underline">
+                ほかのお店を選ぶ（店舗入口へ）
+              </a>
+            </p>
+          </>
+        )}
+
+        {state && shop && route.kind === "owner" && (
+          <>
+            <div className="pt-4">
+              <ShopInfoCard shop={shop} showSetupHint />
+            </div>
+            <div className="mt-6">
+              {shop.pinNeedsSetup ? (
                 <SetupPin
                   key={`sup-${shop.id}`}
                   shop={shop}
                   onSetup={(pin) =>
                     setOwnerPins((prev) => ({ ...prev, [shop.id]: pin }))
                   }
-                  onBack={() => setMode("customer")}
+                  onBack={() => navigateTo("/")}
                 />
               ) : !ownerAuthed || ownerPin === undefined ? (
                 <PinGate
@@ -1876,7 +2002,7 @@ export function App() {
                   onSuccess={(pin) =>
                     setOwnerPins((prev) => ({ ...prev, [shop.id]: pin }))
                   }
-                  onBack={() => setMode("customer")}
+                  onBack={() => navigateTo("/")}
                 />
               ) : (
                 <>
@@ -1937,6 +2063,7 @@ export function App() {
                       onPinChanged={(id, newPin) =>
                         setOwnerPins((prev) => ({ ...prev, [id]: newPin }))
                       }
+                      onSlugChanged={(newSlug) => navigateTo(`/${newSlug}/owner`)}
                     />
                   )}
                 </>

@@ -1,6 +1,7 @@
 -- D1 (Cloudflare) initial schema for a fresh database.
 -- Mirrors the Bun-local Drizzle migrations (drizzle/0002 + drizzle/0003),
--- including the owner-PIN columns. Initial data (2 shops + default menus)
+-- including the owner-PIN columns. The per-shop URL slug column is added
+-- by migrations/0002 (mirroring drizzle/0004). Initial data (2 shops + default menus)
 -- is inserted lazily by the app itself (seedIfEmpty in the getState action),
 -- so no seed SQL is needed here.
 CREATE TABLE shops (

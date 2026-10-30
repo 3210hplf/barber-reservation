@@ -22,6 +22,13 @@
       "when": 1793376000000,
       "tag": "0003_add_owner_pin_to_shops",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1793462400000,
+      "tag": "0004_add_slug_to_shops",
+      "breakpoints": true
     }
   ]
 }

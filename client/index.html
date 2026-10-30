@@ -11,13 +11,14 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="床屋予約" />
-    <link rel="manifest" href="./manifest.webmanifest" />
-    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <title>床屋の予約管理</title>
     <!-- build.mjs copies this file to client/dist/; the bundle and the
-         generated stylesheet live next to it there. -->
-    <link rel="stylesheet" href="./styles.css" />
-    <script src="./main.js" type="module"></script>
+         generated stylesheet live next to it there. Asset URLs are absolute
+         so they resolve from shop paths like /<slug>/owner as well. -->
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/main.js" type="module"></script>
   </head>
   <body>
     <div id="root"></div>

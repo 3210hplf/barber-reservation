@@ -143,12 +143,16 @@ export async function seedIfEmpty(ctx: Ctx) {
   const db = ctx.db<typeof schema>();
   const existing = await db.select().from(schema.shops).limit(1);
   if (existing.length > 0) return;
-  const defaults = [{ name: "お父さんの店" }, { name: "おじさんの店" }];
+  const defaults = [
+    { name: "お父さんの店", slug: "shop1" },
+    { name: "おじさんの店", slug: "shop2" },
+  ];
   for (const d of defaults) {
     const inserted = await db
       .insert(schema.shops)
       .values({
         name: d.name,
+        slug: d.slug,
         ownerPin: "",
         pinChanged: 0,
         openTime: "09:00",
@@ -182,6 +186,7 @@ export async function seedIfEmpty(ctx: Ctx) {
 
 const shopShape = z.object({
   id: z.number(),
+  slug: z.string(),
   name: z.string(),
   address: z.string(),
   phone: z.string(),
@@ -306,6 +311,7 @@ export const Actions = {
       return {
         shops: shopRows.map((s) => ({
           id: s.id,
+          slug: s.slug,
           name: s.name,
           address: s.address,
           phone: s.phone,
@@ -366,9 +372,13 @@ export const Actions = {
     },
   }),
 
-  // お客さん専用: 予約時の電話番号で自分の今後の予約だけを返す
+  // お客さん専用: 予約時の電話番号で、指定した店舗における自分の今後の
+  // 予約だけを返す（店舗専用ページから使うため店舗スコープにする）
   lookupMyBookings: defineAction({
-    request: z.object({ phone: z.string().min(8).max(20) }),
+    request: z.object({
+      shopId: z.number().int(),
+      phone: z.string().min(8).max(20),
+    }),
     response: z.object({ bookings: z.array(bookingShape) }),
     async handler(ctx, args): Promise<{ bookings: z.infer<typeof bookingShape>[] }> {
       const db = ctx.db<typeof schema>();
@@ -377,6 +387,7 @@ export const Actions = {
       const rows = await db
         .select()
         .from(schema.bookings)
+        .where(eq(schema.bookings.shopId, args.shopId))
         .orderBy(asc(schema.bookings.date), asc(schema.bookings.startTime));
       const mine = rows.filter(
         (b) => digits(b.phone) === target && b.status === "booked" && b.date >= today,
@@ -572,6 +583,11 @@ export const Actions = {
     request: z.object({
       id: z.number().int(),
       ownerPin: z.string().regex(/^\d{4}$/),
+      slug: z
+        .string()
+        .min(2)
+        .max(32)
+        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
       name: z.string().min(1).max(50),
       address: z.string().max(200),
       phone: z.string().max(20),
@@ -587,13 +603,26 @@ export const Actions = {
         }),
       ),
     }),
-    response: okShape,
-    async handler(ctx, args): Promise<Ok> {
+    response: pinResultShape,
+    async handler(ctx, args): Promise<PinResult> {
       await requireOwnerPin(ctx, args.id, args.ownerPin);
+      // 「owner」は店主用パスの予約語なのでスラッグには使えない
+      if (args.slug === "owner") {
+        return { ok: false, error: "「owner」はURL用スラッグに使えません" };
+      }
       const db = ctx.db<typeof schema>();
+      const all = await db.select().from(schema.shops);
+      const conflict = all.find((s) => s.id !== args.id && s.slug === args.slug);
+      if (conflict) {
+        return {
+          ok: false,
+          error: `スラッグ「${args.slug}」は他のお店（${conflict.name}）で使われています`,
+        };
+      }
       await db
         .update(schema.shops)
         .set({
+          slug: args.slug,
           name: args.name,
           address: args.address,
           phone: args.phone,
@@ -606,7 +635,7 @@ export const Actions = {
         })
         .where(eq(schema.shops.id, args.id));
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: null };
     },
   }),
 
