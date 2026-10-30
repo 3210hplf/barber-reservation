@@ -13,6 +13,12 @@ export const shops = sqliteTable("shops", {
   closedWeekdays: text("closed_weekdays").notNull().default("[]"),
   // JSON array of {nth: number, weekday: number} e.g. 2nd Tuesday
   nthClosures: text("nth_closures").notNull().default("[]"),
+  // 店主画面用の暗証番号。平文では保存せず、ソルト付きハッシュ
+  // （pbkdf2$反復回数$salt$hash）で保存する。空文字 = 未設定
+  // （初回に店主がその場で決める。既知の初期番号は置かない）
+  ownerPin: text("owner_pin").notNull().default(""),
+  // 0 = 暗証番号が未設定, 1 = 店主が設定済み
+  pinChanged: integer("pin_changed").notNull().default(0),
 });
 
 export const dayOverrides = sqliteTable("day_overrides", {

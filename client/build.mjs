@@ -55,4 +55,13 @@ fs.copyFileSync(
   path.join(distDir, "index.html"),
 );
 
+
+// 4) Static public files (PWA manifest, icon) -> dist root
+const publicDir = path.join(clientDir, "public");
+if (fs.existsSync(publicDir)) {
+  for (const name of fs.readdirSync(publicDir)) {
+    fs.copyFileSync(path.join(publicDir, name), path.join(distDir, name));
+  }
+}
+
 console.log("client built -> client/dist/");

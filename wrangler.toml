@@ -1,0 +1,16 @@
+name = "barber-reservation"
+main = "server/worker.ts"
+compatibility_date = "2026-10-30"
+
+# Built client (bun run build:client) served as Workers Static Assets.
+[assets]
+directory = "./client/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "barber-db"
+# TODO: replace with the real id printed by `wrangler d1 create barber-db`
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

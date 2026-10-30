@@ -9,7 +9,12 @@
     "build:client": "bun ./client/build.mjs",
     "start": "bun server/src/index.ts",
     "db:migrate": "bun server/src/migrate.ts",
-    "typecheck": "bun x tsc --noEmit -p client/tsconfig.json && bun x tsc --noEmit -p server/tsconfig.json"
+    "typecheck": "bun x tsc --noEmit -p client/tsconfig.json && bun x tsc --noEmit -p server/tsconfig.json && bun x tsc --noEmit -p server/tsconfig.worker.json",
+    "dev:cf": "bun run build:client && bun x wrangler dev",
+    "deploy:cf": "bun run build:client && bun x wrangler deploy",
+    "db:create:cf": "bun x wrangler d1 create barber-db",
+    "db:migrate:cf:local": "bun x wrangler d1 migrations apply barber-db --local",
+    "db:migrate:cf": "bun x wrangler d1 migrations apply barber-db --remote"
   },
   "dependencies": {
     "@tanstack/react-query": "5.100.10",
@@ -25,6 +30,8 @@
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "tailwindcss": "4.1.13",
-    "typescript": "5.6.3"
+    "typescript": "5.6.3",
+    "wrangler": "^4.0.0",
+    "@cloudflare/workers-types": "^4.0.0"
   }
 }

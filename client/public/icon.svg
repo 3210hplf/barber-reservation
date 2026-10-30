@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Barber shop icon: striped pole + scissors on the app's navy theme color. -->
+  <rect width="512" height="512" rx="96" fill="#1f3350"/>
+  <!-- barber pole -->
+  <g>
+    <rect x="96" y="96" width="120" height="320" rx="60" fill="#faf7f2"/>
+    <clipPath id="poleClip"><rect x="96" y="96" width="120" height="320" rx="60"/></clipPath>
+    <g clip-path="url(#poleClip)">
+      <path d="M96 160 L216 96 L216 160 L96 224 Z" fill="#c0392b"/>
+      <path d="M96 288 L216 224 L216 288 L96 352 Z" fill="#2e5f8a"/>
+      <path d="M96 416 L216 352 L216 416 L96 480 Z" fill="#c0392b"/>
+    </g>
+    <rect x="96" y="96" width="120" height="320" rx="60" fill="none" stroke="#14243c" stroke-width="10"/>
+    <rect x="84" y="76" width="144" height="28" rx="14" fill="#d9a441"/>
+    <rect x="84" y="408" width="144" height="28" rx="14" fill="#d9a441"/>
+  </g>
+  <!-- scissors -->
+  <g stroke="#faf7f2" stroke-width="22" stroke-linecap="round" fill="none">
+    <line x1="286" y1="150" x2="420" y2="330"/>
+    <line x1="420" y1="150" x2="320" y2="286"/>
+  </g>
+  <g fill="none" stroke="#faf7f2" stroke-width="20">
+    <circle cx="272" cy="128" r="34"/>
+    <circle cx="438" cy="128" r="34"/>
+  </g>
+  <circle cx="352" cy="238" r="14" fill="#d9a441"/>
+</svg>
