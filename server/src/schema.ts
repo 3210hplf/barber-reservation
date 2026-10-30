@@ -2,6 +2,9 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const shops = sqliteTable("shops", {
   id: integer("id").primaryKey({ autoIncrement: true }),
+  // URL用スラッグ（英小文字・数字・ハイフン）。お客さん用 /<slug>、
+  // 店主用 /<slug>/owner のパスに使う。店舗ごとに一意。
+  slug: text("slug").notNull().default(""),
   name: text("name").notNull(),
   address: text("address").notNull().default(""),
   phone: text("phone").notNull().default(""),
