@@ -24,6 +24,18 @@ export const shops = sqliteTable("shops", {
   pinChanged: integer("pin_changed").notNull().default(0),
 });
 
+// 全体管理（admin）の設定。常に行は1つだけ（id = 1）。
+export const adminSettings = sqliteTable("admin_settings", {
+  id: integer("id").primaryKey(),
+  // 管理者パスワード。平文では保存せず、店主暗証番号と同じ形式
+  // （pbkdf2$反復回数$salt$hash のソルト付きハッシュ）で保存する。
+  // 空文字 = 未設定（初回に管理者本人がその場で決める。
+  // 既知の初期パスワードは置かない）
+  passwordHash: text("password_hash").notNull().default(""),
+  // 0 = 管理者パスワードが未設定, 1 = 管理者が設定済み
+  isSet: integer("is_set").notNull().default(0),
+});
+
 export const dayOverrides = sqliteTable("day_overrides", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   shopId: integer("shop_id").notNull(),

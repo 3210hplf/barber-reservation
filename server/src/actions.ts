@@ -104,10 +104,15 @@ async function pbkdf2(pin: string, salt: Uint8Array, iterations: number): Promis
   return new Uint8Array(bits);
 }
 
-async function hashPin(pin: string): Promise<string> {
+// Hashes a secret into the `pbkdf2$<iterations>$<salt>$<hash>` storage
+// format. Used for owner PINs (PIN_ITERATIONS) and for the admin password
+// (ADMIN_PASSWORD_ITERATIONS, defined with the admin helpers below).
+// verifyPin() below reads the iteration count back out of the stored
+// string, so it verifies either kind of secret unchanged.
+async function hashPin(pin: string, iterations: number = PIN_ITERATIONS): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const hash = await pbkdf2(pin, salt, PIN_ITERATIONS);
-  return `pbkdf2$${PIN_ITERATIONS}$${toB64(salt)}$${toB64(hash)}`;
+  const hash = await pbkdf2(pin, salt, iterations);
+  return `pbkdf2$${iterations}$${toB64(salt)}$${toB64(hash)}`;
 }
 
 async function verifyPin(stored: string, pin: string): Promise<boolean> {
@@ -218,6 +223,47 @@ const pinResultShape = z.object({
   error: z.string().nullable(),
 });
 type PinResult = z.infer<typeof pinResultShape>;
+
+// ---------- admin (全体管理) ----------
+//
+// The admin password is stored exactly like owner PINs (salted PBKDF2 in
+// the `pbkdf2$<iterations>$<salt>$<hash>` format, constant-time compare
+// via verifyPin), just with more iterations. Plaintext is never stored
+// and there is no known default password: while unset, only the first
+// person to open /admin can set it (setupAdminPassword refuses once set).
+
+const ADMIN_PASSWORD_ITERATIONS = 120000;
+
+// Slugs that can never be assigned to a shop: "owner" is the per-shop
+// owner path segment, "admin" is the whole-app admin page path.
+const RESERVED_SLUGS = new Set(["owner", "admin"]);
+
+type AdminRow = typeof schema.adminSettings.$inferSelect;
+
+async function getAdminRow(ctx: Ctx): Promise<AdminRow> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.adminSettings)
+    .where(eq(schema.adminSettings.id, 1));
+  const row = rows[0];
+  if (row) return row;
+  await db
+    .insert(schema.adminSettings)
+    .values({ id: 1, passwordHash: "", isSet: 0 });
+  return { id: 1, passwordHash: "", isSet: 0 };
+}
+
+async function verifyAdmin(ctx: Ctx, password: string): Promise<boolean> {
+  const row = await getAdminRow(ctx);
+  if (row.isSet === 0 || !row.passwordHash) return false;
+  return verifyPin(row.passwordHash, password);
+}
+
+async function requireAdmin(ctx: Ctx, password: string): Promise<void> {
+  const ok = await verifyAdmin(ctx, password);
+  if (!ok) throw new Error("管理者認証が必要です。パスワードが違います");
+}
 
 const menuShape = z.object({
   id: z.number(),
@@ -606,9 +652,9 @@ export const Actions = {
     response: pinResultShape,
     async handler(ctx, args): Promise<PinResult> {
       await requireOwnerPin(ctx, args.id, args.ownerPin);
-      // 「owner」は店主用パスの予約語なのでスラッグには使えない
-      if (args.slug === "owner") {
-        return { ok: false, error: "「owner」はURL用スラッグに使えません" };
+      // 「owner」「admin」はパスの予約語なのでスラッグには使えない
+      if (RESERVED_SLUGS.has(args.slug)) {
+        return { ok: false, error: `「${args.slug}」はURL用スラッグに使えません` };
       }
       const db = ctx.db<typeof schema>();
       const all = await db.select().from(schema.shops);
@@ -726,6 +772,228 @@ export const Actions = {
       await db.delete(schema.menus).where(eq(schema.menus.id, args.id));
       ctx.invalidateQueries();
       return { ok: true };
+    },
+  }),
+
+  // ---------- admin (全体管理) ----------
+  // /admin ページ専用。管理者パスワードは店主暗証番号と同じ
+  // ソルト付きハッシュ形式で保存し、既知の初期パスワードは置かない。
+  // 未設定の間だけ、最初に開いた管理者本人が設定できる。
+
+  // 管理者パスワードが未設定かどうかだけを返す（パスワード自体や
+  // 店舗情報は一切返さない）
+  getAdminStatus: defineAction({
+    request: z.object({}),
+    response: z.object({ needsSetup: z.boolean() }),
+    async handler(ctx): Promise<{ needsSetup: boolean }> {
+      await seedIfEmpty(ctx);
+      const row = await getAdminRow(ctx);
+      return { needsSetup: row.isSet === 0 };
+    },
+  }),
+
+  // 初回設定: 管理者パスワードが未設定の間だけ設定できる
+  setupAdminPassword: defineAction({
+    request: z.object({
+      newPassword: z.string().min(6).max(128),
+    }),
+    response: pinResultShape,
+    async handler(ctx, args): Promise<PinResult> {
+      const row = await getAdminRow(ctx);
+      if (row.isSet !== 0) {
+        return { ok: false, error: "すでに管理者パスワードが設定されています" };
+      }
+      const db = ctx.db<typeof schema>();
+      await db
+        .update(schema.adminSettings)
+        .set({
+          passwordHash: await hashPin(args.newPassword, ADMIN_PASSWORD_ITERATIONS),
+          isSet: 1,
+        })
+        .where(eq(schema.adminSettings.id, 1));
+      ctx.invalidateQueries();
+      return { ok: true, error: null };
+    },
+  }),
+
+  verifyAdminPassword: defineAction({
+    request: z.object({ password: z.string().min(1).max(128) }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args): Promise<{ ok: boolean }> {
+      const ok = await verifyAdmin(ctx, args.password);
+      return { ok };
+    },
+  }),
+
+  // 変更には現在のパスワードの照合が必須
+  changeAdminPassword: defineAction({
+    request: z.object({
+      currentPassword: z.string().min(1).max(128),
+      newPassword: z.string().min(6).max(128),
+    }),
+    response: pinResultShape,
+    async handler(ctx, args): Promise<PinResult> {
+      const row = await getAdminRow(ctx);
+      if (row.isSet === 0) {
+        return { ok: false, error: "管理者パスワードがまだ設定されていません" };
+      }
+      const ok = await verifyAdmin(ctx, args.currentPassword);
+      if (!ok) return { ok: false, error: "今のパスワードが違います" };
+      if (args.newPassword === args.currentPassword) {
+        return { ok: false, error: "新しいパスワードが今と同じです" };
+      }
+      const db = ctx.db<typeof schema>();
+      await db
+        .update(schema.adminSettings)
+        .set({
+          passwordHash: await hashPin(args.newPassword, ADMIN_PASSWORD_ITERATIONS),
+          isSet: 1,
+        })
+        .where(eq(schema.adminSettings.id, 1));
+      ctx.invalidateQueries();
+      return { ok: true, error: null };
+    },
+  }),
+
+  // 管理者専用: 全店舗の一覧（スラッグ・店主PIN設定状態つき）。
+  // 未認証では何も返さない（requireAdmin が例外を投げる）
+  adminListShops: defineAction({
+    request: z.object({ adminPassword: z.string().min(1).max(128) }),
+    response: z.object({ shops: z.array(shopShape) }),
+    async handler(ctx, args): Promise<{ shops: z.infer<typeof shopShape>[] }> {
+      await requireAdmin(ctx, args.adminPassword);
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.shops).orderBy(asc(schema.shops.id));
+      return {
+        shops: rows.map((s) => ({
+          id: s.id,
+          slug: s.slug,
+          name: s.name,
+          address: s.address,
+          phone: s.phone,
+          openTime: s.openTime,
+          closeTime: s.closeTime,
+          slotMinutes: s.slotMinutes,
+          chairs: s.chairs,
+          closedWeekdays: parseWeekdays(s.closedWeekdays),
+          nthClosures: parseNth(s.nthClosures),
+          pinNeedsSetup: s.pinChanged === 0,
+        })),
+      };
+    },
+  }),
+
+  // 管理者専用: 店舗の追加。初期値は営業時間 09:00–19:00・枠30分・
+  // 椅子1台・月曜＋第2/第3火曜定休・デフォルトメニュー6種で、
+  // 店主暗証番号は未設定（店主本人が後で初回設定する）
+  adminCreateShop: defineAction({
+    request: z.object({
+      adminPassword: z.string().min(1).max(128),
+      name: z.string().min(1).max(50),
+      slug: z.string().min(2).max(32).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+      address: z.string().max(200),
+      phone: z.string().max(20),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      shopId: z.number().nullable(),
+    }),
+    async handler(
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; error: string | null; shopId: number | null }> {
+      try {
+        await requireAdmin(ctx, args.adminPassword);
+      } catch {
+        return { ok: false, error: "管理者認証が必要です。パスワードが違います", shopId: null };
+      }
+      if (RESERVED_SLUGS.has(args.slug)) {
+        return { ok: false, error: `「${args.slug}」はスラッグに使えません`, shopId: null };
+      }
+      const db = ctx.db<typeof schema>();
+      const all = await db.select().from(schema.shops);
+      const conflict = all.find((s) => s.slug === args.slug);
+      if (conflict) {
+        return {
+          ok: false,
+          error: `スラッグ「${args.slug}」は他のお店（${conflict.name}）で使われています`,
+          shopId: null,
+        };
+      }
+      const inserted = await db
+        .insert(schema.shops)
+        .values({
+          name: args.name.trim(),
+          slug: args.slug.trim(),
+          address: args.address.trim(),
+          phone: args.phone.trim(),
+          ownerPin: "",
+          pinChanged: 0,
+          openTime: "09:00",
+          closeTime: "19:00",
+          slotMinutes: 30,
+          chairs: 1,
+          closedWeekdays: JSON.stringify([1]),
+          nthClosures: JSON.stringify([
+            { nth: 2, weekday: 2 },
+            { nth: 3, weekday: 2 },
+          ]),
+        })
+        .returning({ id: schema.shops.id });
+      const shop = inserted[0];
+      if (!shop) return { ok: false, error: "店舗の作成に失敗しました", shopId: null };
+      for (let i = 0; i < DEFAULT_MENUS.length; i++) {
+        const m = DEFAULT_MENUS[i];
+        if (!m) continue;
+        await db.insert(schema.menus).values({
+          shopId: shop.id,
+          name: m.name,
+          price: m.price,
+          minutes: m.minutes,
+          sortOrder: i,
+        });
+      }
+      ctx.invalidateQueries();
+      return { ok: true, error: null, shopId: shop.id };
+    },
+  }),
+
+  // 管理者専用: 既存店舗のスラッグ変更。重複と予約語はサーバー側でも拒否する
+  adminUpdateSlug: defineAction({
+    request: z.object({
+      adminPassword: z.string().min(1).max(128),
+      shopId: z.number().int(),
+      slug: z.string().min(2).max(32).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+    }),
+    response: pinResultShape,
+    async handler(ctx, args): Promise<PinResult> {
+      try {
+        await requireAdmin(ctx, args.adminPassword);
+      } catch {
+        return { ok: false, error: "管理者認証が必要です。パスワードが違います" };
+      }
+      if (RESERVED_SLUGS.has(args.slug)) {
+        return { ok: false, error: `「${args.slug}」はスラッグに使えません` };
+      }
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId));
+      const shop = rows[0];
+      if (!shop) return { ok: false, error: "お店が見つかりません" };
+      const all = await db.select().from(schema.shops);
+      const conflict = all.find((s) => s.id !== args.shopId && s.slug === args.slug);
+      if (conflict) {
+        return {
+          ok: false,
+          error: `スラッグ「${args.slug}」は他のお店（${conflict.name}）で使われています`,
+        };
+      }
+      await db
+        .update(schema.shops)
+        .set({ slug: args.slug })
+        .where(eq(schema.shops.id, args.shopId));
+      ctx.invalidateQueries();
+      return { ok: true, error: null };
     },
   }),
 } satisfies ActionsModule;
