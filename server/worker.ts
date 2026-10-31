@@ -7,12 +7,16 @@
 //   which is configured with single-page-application fallback in
 //   wrangler.toml.
 //
-// Initial data (2 shops + default menus) is seeded lazily by the getState
-// action itself (seedIfEmpty), so a freshly migrated D1 database needs no
-// separate seed step.
+// Session handling mirrors the Bun server: the session token comes from
+// the `cal_session` cookie, and Set-Cookie values queued by handlers are
+// appended to the response. This code uses Web-standard APIs only — no
+// Node.js compatibility features (see wrangler.toml: Node compat is
+// explicitly disabled).
+//
+// Nothing is seeded on Workers: accounts are created through signup.
 
 import { drizzle } from "drizzle-orm/d1";
-import { Actions } from "./src/actions";
+import { Actions, SESSION_COOKIE_NAME } from "./src/actions";
 import type { ActionDef, Ctx } from "./src/framework";
 import * as schema from "./src/schema";
 
@@ -21,8 +25,19 @@ export interface Env {
   ASSETS: Fetcher;
 }
 
-function createWorkerCtx(env: Env): Ctx {
+function createWorkerCtx(env: Env, req: Request): Ctx {
   const d1db = drizzle(env.DB, { schema });
+  let sessionToken: string | null = null;
+  const cookie = req.headers.get("cookie");
+  if (cookie) {
+    for (const part of cookie.split(";")) {
+      const [name, ...rest] = part.trim().split("=");
+      if (name === SESSION_COOKIE_NAME) {
+        const value = rest.join("=");
+        sessionToken = value ? decodeURIComponent(value) : null;
+      }
+    }
+  }
   return {
     // The framework's Ctx is typed against the Bun SQLite driver. The D1
     // driver exposes the same query-builder API the handlers use, so the
@@ -31,6 +46,9 @@ function createWorkerCtx(env: Env): Ctx {
     invalidateQueries: () => {
       // No-op on Workers too: the web client invalidates its own queries.
     },
+    sessionToken,
+    secureCookie: new URL(req.url).protocol === "https:",
+    setCookies: [],
   };
 }
 
@@ -61,9 +79,14 @@ async function handleAction(req: Request, env: Env): Promise<Response> {
   if (!parsed.success) {
     return jsonError(400, `invalid args for ${action}: ${parsed.error.message}`);
   }
+  const ctx = createWorkerCtx(env, req);
   try {
-    const result = await def.handler(createWorkerCtx(env), parsed.data);
-    return Response.json(result ?? null);
+    const result = await def.handler(ctx, parsed.data);
+    const res = Response.json(result ?? null);
+    if (ctx.setCookies.length === 0) return res;
+    const out = new Response(res.body, res);
+    for (const c of ctx.setCookies) out.headers.append("set-cookie", c);
+    return out;
   } catch (err) {
     console.error(`action ${action} failed`, err);
     return jsonError(500, err instanceof Error ? err.message : "internal error");

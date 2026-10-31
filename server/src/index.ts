@@ -3,20 +3,23 @@
 // - POST /actions  { action: string, args: object } -> JSON result
 // - GET  /*        static files from client/dist, SPA fallback to index.html
 //
-// Migrations are applied automatically on startup (the seed data is NOT
-// inserted here — run `bun run db:migrate` once for the initial data, or
-// rely on the getState action, which also seeds an empty database).
+// Session handling: the session token is read from the `cal_session`
+// cookie and handed to the action handlers via a per-request Ctx; any
+// Set-Cookie values the handlers queue (login / logout / edit link) are
+// appended to the response.
+//
+// Migrations are applied automatically on startup. Initial demo data is
+// inserted by `bun run db:migrate` (seedIfEmpty), not here.
 
 import path from "node:path";
-import { Actions } from "./actions";
+import { Actions, SESSION_COOKIE_NAME } from "./actions";
 import { createCtx, runMigrations } from "./db";
-import type { ActionDef } from "./framework";
+import type { ActionDef, Ctx } from "./framework";
 
 runMigrations();
 
 const PORT = Number(process.env.PORT ?? 3000);
 const clientDist = path.join(import.meta.dir, "..", "..", "client", "dist");
-const ctx = createCtx();
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyAction = ActionDef<any, any>;
@@ -24,6 +27,26 @@ const actions = Actions as unknown as Record<string, AnyAction>;
 
 function jsonError(status: number, message: string): Response {
   return Response.json({ error: message }, { status });
+}
+
+function sessionTokenFrom(req: Request): string | null {
+  const cookie = req.headers.get("cookie");
+  if (!cookie) return null;
+  for (const part of cookie.split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (name === SESSION_COOKIE_NAME) {
+      const value = rest.join("=");
+      return value ? decodeURIComponent(value) : null;
+    }
+  }
+  return null;
+}
+
+function withCookies(res: Response, ctx: Ctx): Response {
+  if (ctx.setCookies.length === 0) return res;
+  const out = new Response(res.body, res);
+  for (const c of ctx.setCookies) out.headers.append("set-cookie", c);
+  return out;
 }
 
 async function handleAction(req: Request): Promise<Response> {
@@ -45,9 +68,13 @@ async function handleAction(req: Request): Promise<Response> {
   if (!parsed.success) {
     return jsonError(400, `invalid args for ${action}: ${parsed.error.message}`);
   }
+  const ctx = createCtx({
+    sessionToken: sessionTokenFrom(req),
+    secureCookie: new URL(req.url).protocol === "https:",
+  });
   try {
     const result = await def.handler(ctx, parsed.data);
-    return Response.json(result ?? null);
+    return withCookies(Response.json(result ?? null), ctx);
   } catch (err) {
     console.error(`action ${action} failed`, err);
     return jsonError(500, err instanceof Error ? err.message : "internal error");

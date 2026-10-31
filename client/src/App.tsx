@@ -1,780 +1,1715 @@
-import { useEffect, useMemo, useState } from "react";
+// 営業日カレンダー — client app (React SPA, real-path routing).
+//
+// Routes:
+//   /                サービス紹介ランディング
+//   /signup          新規登録（ID + パスワード）
+//   /login           ログイン
+//   /admin           運営用・全体管理（導線なし）
+//   /<slug>          公開カレンダー（誰でも閲覧可）
+//   /<slug>/edit     編集画面（ログイン or 編集リンクのセッションが必要）
+//   /<slug>/<uuid>   秘密編集リンク（照合して /<slug>/edit へ）
+//
+// デザイン方針: 配色・余白・文字の美しさで魅せる。お店のテーマ
+// （data-theme + CSS変数）が公開・編集の両画面に反映される。
+
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { SafeAreaTopScrim } from "./SafeArea";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type ApiResponse } from "./api";
+import { SafeAreaTopScrim } from "./SafeArea";
 
-type State = ApiResponse<typeof api, "getState">;
-type Shop = State["shops"][number];
-type Booking = State["bookings"][number];
-// 氏名・電話番号つきの予約（店主認証後／自分の電話番号での検索でのみ取得）
-type FullBooking = ApiResponse<typeof api, "getOwnerBookings">["bookings"][number];
-type Override = State["overrides"][number];
+// ---------- types ----------
 
-// ---------- date / time helpers ----------
+type CalendarData = ApiResponse<typeof api, "getCalendar">;
+type Override = CalendarData["overrides"][number];
 
-const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+type CalRules = {
+  closedWeekdays: number[];
+  nthClosures: { nth: number; weekday: number }[];
+};
+
+// ---------- date helpers ----------
+
+const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
+const NTH_LABELS = ["", "第1", "第2", "第3", "第4", "第5"];
 
 function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-function dateStr(y: number, m: number, d: number): string {
-  return `${y}-${pad(m)}-${pad(d)}`;
+function todayJST(): string {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Tokyo" });
 }
 
-function parseDate(s: string): Date {
-  return new Date(`${s}T00:00:00`);
-}
-
-function addDays(s: string, n: number): string {
-  const d = parseDate(s);
-  d.setDate(d.getDate() + n);
-  return dateStr(d.getFullYear(), d.getMonth() + 1, d.getDate());
-}
-
-function fmtDateJP(s: string): string {
-  const d = parseDate(s);
-  return `${d.getMonth() + 1}月${d.getDate()}日（${WEEKDAYS[d.getDay()] ?? ""}）`;
-}
-
-function toMin(t: string): number {
-  const [h = 0, m = 0] = t.split(":").map(Number);
-  return h * 60 + m;
-}
-
-function toHHMM(min: number): string {
-  return `${pad(Math.floor(min / 60))}:${pad(min % 60)}`;
-}
-
-function nowJSTMinutes(): number {
-  const parts = new Intl.DateTimeFormat("ja-JP", {
+function nowTimeJST(): string {
+  return new Date().toLocaleTimeString("en-GB", {
     timeZone: "Asia/Tokyo",
     hour: "2-digit",
     minute: "2-digit",
-    hour12: false,
-  }).formatToParts(new Date());
-  const h = Number(parts.find((p) => p.type === "hour")?.value ?? 0);
-  const m = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
-  return h * 60 + m;
+  });
 }
 
-function digits(s: string): string {
-  return s.replace(/[^0-9]/g, "");
+function ymOf(dateStr: string): string {
+  return dateStr.slice(0, 7);
 }
 
-type DayStatus = { open: boolean; label: string; override: boolean };
+function shiftYM(ym: string, delta: number): string {
+  const [y, m] = ym.split("-").map(Number);
+  const d = new Date(y as number, (m as number) - 1 + delta, 1);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+}
 
-function dayStatus(shop: Shop, overrides: Override[], date: string): DayStatus {
-  const ov = overrides.find((o) => o.shopId === shop.id && o.date === date);
-  if (ov) {
-    return ov.kind === "open"
-      ? { open: true, label: "臨時営業", override: true }
-      : { open: false, label: "臨時休業", override: true };
-  }
-  const d = parseDate(date);
+function dateLabel(dateStr: string): string {
+  const d = new Date(`${dateStr}T00:00:00`);
+  return `${d.getMonth() + 1}月${d.getDate()}日（${WEEKDAY_LABELS[d.getDay()]}）`;
+}
+
+function isOpenDay(rules: CalRules, overrides: Map<string, Override>, date: string): boolean {
+  const ov = overrides.get(date);
+  if (ov) return ov.kind === "open";
+  const d = new Date(`${date}T00:00:00`);
   const weekday = d.getDay();
+  if (rules.closedWeekdays.includes(weekday)) return false;
   const nth = Math.ceil(d.getDate() / 7);
-  const closed =
-    shop.closedWeekdays.includes(weekday) ||
-    shop.nthClosures.some((c) => c.nth === nth && c.weekday === weekday);
-  return closed
-    ? { open: false, label: "定休日", override: false }
-    : { open: true, label: "営業日", override: false };
+  if (rules.nthClosures.some((c) => c.nth === nth && c.weekday === weekday)) return false;
+  return true;
 }
 
-function coveringCount(bookings: Booking[], shopId: number, date: string, atMin: number): number {
-  return bookings.filter((b) => {
-    if (b.shopId !== shopId || b.date !== date || b.status !== "booked") return false;
-    const s = toMin(b.startTime);
-    return s <= atMin && atMin < s + b.minutes;
-  }).length;
+function effectiveHours(
+  shop: { openTime: string; closeTime: string },
+  override: Override | undefined,
+): { open: string; close: string; custom: boolean } {
+  if (override?.hours) {
+    const [open = shop.openTime, close = shop.closeTime] = override.hours.split("-");
+    return { open, close, custom: true };
+  }
+  return { open: shop.openTime, close: shop.closeTime, custom: false };
 }
 
-function closedSummary(shop: Shop): string {
+function closedRuleText(shop: CalRules): string {
   const parts: string[] = [];
   if (shop.closedWeekdays.length > 0) {
-    parts.push(`毎週${shop.closedWeekdays.map((w) => `${WEEKDAYS[w] ?? ""}曜`).join("・")}`);
+    parts.push(`毎週${shop.closedWeekdays.map((w) => `${WEEKDAY_LABELS[w]}曜日`).join("・")}`);
   }
   for (const c of shop.nthClosures) {
-    parts.push(`第${c.nth}${WEEKDAYS[c.weekday] ?? ""}曜`);
+    parts.push(`${NTH_LABELS[c.nth]}${WEEKDAY_LABELS[c.weekday]}曜日`);
   }
   return parts.length > 0 ? parts.join("、") : "なし";
 }
 
+function relativeUpdated(iso: string | null, today: string): string | null {
+  if (!iso) return null;
+  const updatedDate = new Date(iso).toLocaleDateString("en-CA", { timeZone: "Asia/Tokyo" });
+  const diffDays = Math.round(
+    (new Date(`${today}T00:00:00`).getTime() - new Date(`${updatedDate}T00:00:00`).getTime()) /
+      86400000,
+  );
+  const d = new Date(iso);
+  const datePart = `${d.getMonth() + 1}月${d.getDate()}日`;
+  if (diffDays <= 0) return `${datePart}（今日）更新`;
+  if (diffDays === 1) return `${datePart}（昨日）更新`;
+  if (diffDays <= 30) return `${datePart}（${diffDays}日前）更新`;
+  return `${datePart} 更新`;
+}
+
 // ---------- shared UI ----------
 
-function MonthCalendar({
-  shop,
-  overrides,
-  bookings,
-  today,
-  selected,
-  onSelect,
-  showLoad,
-}: {
-  shop: Shop;
-  overrides: Override[];
-  bookings: Booking[];
+const THEME_OPTIONS: { key: string; label: string; accent: string; bg: string }[] = [
+  { key: "standard", label: "スタンダード", accent: "#1f3350", bg: "#f6f3ec" },
+  { key: "warm", label: "ウォーム", accent: "#a84e28", bg: "#faf2e9" },
+  { key: "sakura", label: "さくら", accent: "#b84f6e", bg: "#fdf3f4" },
+  { key: "forest", label: "フォレスト", accent: "#2e6b4f", bg: "#f1f5ef" },
+  { key: "ocean", label: "オーシャン", accent: "#1565a0", bg: "#eef4f9" },
+  { key: "mono", label: "モノ", accent: "#26262c", bg: "#f3f3f4" },
+];
+
+function Card(props: { children: React.ReactNode; className?: string }) {
+  return (
+    <section
+      className={`rounded-[28px] border p-5 sm:p-6 ${props.className ?? ""}`}
+      style={{
+        background: "var(--surface)",
+        borderColor: "var(--border)",
+        boxShadow: "0 12px 40px rgba(30, 25, 15, 0.06)",
+      }}
+    >
+      {props.children}
+    </section>
+  );
+}
+
+function PrimaryButton(props: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+  type?: "button" | "submit";
+}) {
+  return (
+    <button
+      type={props.type ?? "button"}
+      onClick={props.onClick}
+      disabled={props.disabled}
+      className="min-h-14 w-full rounded-2xl px-6 text-base font-semibold tracking-wide transition-opacity disabled:opacity-40"
+      style={{ background: "var(--accent)", color: "var(--accent-text)" }}
+    >
+      {props.children}
+    </button>
+  );
+}
+
+function GhostButton(props: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={props.onClick}
+      disabled={props.disabled}
+      className="min-h-14 w-full rounded-2xl border px-6 text-base font-semibold tracking-wide disabled:opacity-40"
+      style={{
+        background: "var(--surface)",
+        borderColor: "var(--border)",
+        color: "var(--text)",
+      }}
+    >
+      {props.children}
+    </button>
+  );
+}
+
+function TextInput(props: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  type?: string;
+  placeholder?: string;
+  autoComplete?: string;
+  hint?: string;
+}) {
+  return (
+    <label className="block">
+      <span
+        className="mb-2 block text-sm font-semibold tracking-wide"
+        style={{ color: "var(--dim)" }}
+      >
+        {props.label}
+      </span>
+      <input
+        type={props.type ?? "text"}
+        value={props.value}
+        onChange={(e) => props.onChange(e.target.value)}
+        placeholder={props.placeholder}
+        autoComplete={props.autoComplete}
+        className="min-h-14 w-full rounded-2xl border px-4 text-base outline-none"
+        style={{
+          background: "var(--surface)",
+          borderColor: "var(--border)",
+          color: "var(--text)",
+        }}
+      />
+      {props.hint ? (
+        <span className="mt-2 block text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+          {props.hint}
+        </span>
+      ) : null}
+    </label>
+  );
+}
+
+function ErrorBox(props: { message: string | null }) {
+  if (!props.message) return null;
+  return (
+    <p
+      className="rounded-2xl px-4 py-3 text-sm leading-relaxed"
+      style={{ background: "var(--closed-bg)", color: "var(--closed)" }}
+      role="alert"
+    >
+      {props.message}
+    </p>
+  );
+}
+
+// ---------- calendar grid (public & edit shared) ----------
+
+function buildMonthCells(ym: string): (string | null)[] {
+  const [y, m] = ym.split("-").map(Number);
+  const first = new Date(y as number, (m as number) - 1, 1);
+  const daysInMonth = new Date(y as number, m as number, 0).getDate();
+  const cells: (string | null)[] = [];
+  for (let i = 0; i < first.getDay(); i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(`${ym}-${pad(d)}`);
+  while (cells.length % 7 !== 0) cells.push(null);
+  return cells;
+}
+
+function CalendarGrid(props: {
+  rules: CalRules;
+  overrides: Map<string, Override>;
+  yearMonth: string;
   today: string;
   selected: string | null;
-  onSelect: (date: string) => void;
-  showLoad: boolean;
+  onSelect?: (date: string) => void;
 }) {
-  const base = selected ? parseDate(selected) : parseDate(today);
-  const [viewY, setViewY] = useState(base.getFullYear());
-  const [viewM, setViewM] = useState(base.getMonth() + 1);
-
-  const first = new Date(viewY, viewM - 1, 1);
-  const startOffset = first.getDay();
-  const daysInMonth = new Date(viewY, viewM, 0).getDate();
-  const cells: (string | null)[] = [];
-  for (let i = 0; i < startOffset; i++) cells.push(null);
-  for (let d = 1; d <= daysInMonth; d++) cells.push(dateStr(viewY, viewM, d));
-
-  const moveMonth = (delta: number) => {
-    const nm = viewM + delta;
-    if (nm < 1) {
-      setViewY(viewY - 1);
-      setViewM(12);
-    } else if (nm > 12) {
-      setViewY(viewY + 1);
-      setViewM(1);
-    } else {
-      setViewM(nm);
-    }
-  };
-
+  const cells = useMemo(() => buildMonthCells(props.yearMonth), [props.yearMonth]);
   return (
     <div>
-      <div className="flex items-center justify-between">
-        <button
-          type="button"
-          aria-label="前の月"
-          onClick={() => moveMonth(-1)}
-          className="min-h-12 min-w-12 rounded-full bg-[var(--surface-alt)] text-2xl font-bold text-[var(--text)]"
-        >
-          ‹
-        </button>
-        <p className="text-xl font-bold">
-          {viewY}年{viewM}月
-        </p>
-        <button
-          type="button"
-          aria-label="次の月"
-          onClick={() => moveMonth(1)}
-          className="min-h-12 min-w-12 rounded-full bg-[var(--surface-alt)] text-2xl font-bold text-[var(--text)]"
-        >
-          ›
-        </button>
-      </div>
-      <div className="mt-2 grid grid-cols-7 text-center text-base font-bold">
-        {WEEKDAYS.map((w, i) => (
+      <div className="mb-2 grid grid-cols-7">
+        {WEEKDAY_LABELS.map((w, i) => (
           <div
             key={w}
-            className={i === 0 ? "text-[var(--red)]" : i === 6 ? "text-[var(--accent)]" : "text-[var(--dim)]"}
+            className="pb-1 text-center text-xs font-semibold tracking-widest"
+            style={{
+              color: i === 0 ? "var(--closed)" : i === 6 ? "var(--accent)" : "var(--dim)",
+            }}
           >
             {w}
           </div>
         ))}
       </div>
-      <div className="mt-1 grid grid-cols-7 gap-1">
+      <div className="grid grid-cols-7 gap-1.5">
         {cells.map((date, i) => {
-          if (date === null) return <div key={`empty-${i}`} />;
-          const st = dayStatus(shop, overrides, date);
-          const isPast = date < today;
-          const isToday = date === today;
-          const isSel = date === selected;
-          const dayBookings = bookings.filter(
-            (b) => b.shopId === shop.id && b.date === date && b.status === "booked",
-          ).length;
-          return (
+          if (!date) return <div key={`e-${i}`} />;
+          const open = isOpenDay(props.rules, props.overrides, date);
+          const ov = props.overrides.get(date);
+          const isToday = date === props.today;
+          const isSelected = date === props.selected;
+          const dayNum = Number(date.slice(8));
+          const style: React.CSSProperties = {};
+          if (isSelected) {
+            style.background = "var(--accent)";
+            style.color = "var(--accent-text)";
+          } else if (!open) {
+            style.background = "var(--closed-bg)";
+            style.color = "var(--closed)";
+          } else {
+            style.color = "var(--text)";
+          }
+          if (isToday && !isSelected) {
+            style.boxShadow = "inset 0 0 0 2px var(--accent)";
+          }
+          const inner = (
+            <>
+              <span className="tnum text-base leading-none font-semibold">{dayNum}</span>
+              <span className="mt-1 flex h-3 items-center justify-center gap-1">
+                {!open ? (
+                  <span className="text-[10px] leading-none font-semibold tracking-widest">休</span>
+                ) : ov?.note ? (
+                  <span
+                    className="h-1.5 w-1.5 rounded-full"
+                    style={{ background: isSelected ? "var(--accent-text)" : "var(--accent)" }}
+                  />
+                ) : ov ? (
+                  <span
+                    className="h-1.5 w-1.5 rounded-full opacity-50"
+                    style={{ background: isSelected ? "var(--accent-text)" : "var(--dim)" }}
+                  />
+                ) : null}
+              </span>
+            </>
+          );
+          const cls = "flex min-h-[52px] flex-col items-center justify-center rounded-2xl py-1.5";
+          return props.onSelect ? (
             <button
               key={date}
               type="button"
-              disabled={isPast}
-              onClick={() => onSelect(date)}
-              aria-label={`${fmtDateJP(date)} ${st.label}`}
-              className={[
-                "flex min-h-16 flex-col items-center justify-center rounded-[var(--radius)] border-2 px-0.5 py-1",
-                isSel
-                  ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-text)]"
-                  : st.open
-                    ? "border-[var(--border)] bg-[var(--surface)] text-[var(--text)]"
-                    : "border-transparent bg-[var(--surface-alt)] text-[var(--dim)]",
-                isPast ? "opacity-40" : "",
-                isToday && !isSel ? "ring-2 ring-[var(--red)] ring-inset" : "",
-              ].join(" ")}
+              className={cls}
+              style={style}
+              onClick={() => props.onSelect?.(date)}
+              aria-label={`${dateLabel(date)} ${open ? "営業日" : "休業日"}`}
             >
-              <span className="text-xl font-bold leading-none">{parseDate(date).getDate()}</span>
-              <span className={`mt-1 text-xs font-bold leading-none ${isSel ? "" : st.open ? "text-[var(--green)]" : "text-[var(--red)]"}`}>
-                {date === today ? "今日" : st.open ? "営業" : st.label === "臨時休業" ? "臨時休" : "休み"}
-              </span>
-              {showLoad && st.open && !isPast && (
-                <span className={`text-xs leading-tight ${isSel ? "" : "text-[var(--dim)]"}`}>
-                  予約{dayBookings}件
-                </span>
-              )}
+              {inner}
             </button>
+          ) : (
+            <div key={date} className={cls} style={style}>
+              {inner}
+            </div>
           );
         })}
       </div>
-      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-[var(--dim)]">
-        <span>● <span className="text-[var(--green)] font-bold">営業</span>：営業日</span>
-        <span>● 休み：定休日・臨時休業</span>
-        <span>枠つき：今日</span>
-      </div>
     </div>
   );
 }
 
-const inputCls =
-  "w-full min-h-14 rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] px-4 text-lg text-[var(--text)]";
-const labelCls = "block text-base font-bold text-[var(--text)] mb-1";
-const bigBtnCls =
-  "w-full min-h-14 rounded-[var(--radius)] bg-[var(--accent)] px-4 text-xl font-bold text-[var(--accent-text)] disabled:opacity-40";
+function MonthNav(props: { yearMonth: string; onChange: (ym: string) => void }) {
+  const [y, m] = props.yearMonth.split("-").map(Number);
+  return (
+    <div className="mb-4 flex items-center justify-between">
+      <button
+        type="button"
+        aria-label="前の月"
+        className="flex h-12 w-12 items-center justify-center rounded-full text-2xl"
+        style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+        onClick={() => props.onChange(shiftYM(props.yearMonth, -1))}
+      >
+        ‹
+      </button>
+      <h2 className="tnum text-lg font-bold tracking-wide">
+        {y}年 {m}月
+      </h2>
+      <button
+        type="button"
+        aria-label="次の月"
+        className="flex h-12 w-12 items-center justify-center rounded-full text-2xl"
+        style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+        onClick={() => props.onChange(shiftYM(props.yearMonth, 1))}
+      >
+        ›
+      </button>
+    </div>
+  );
+}
 
-// ---------- customer: booking flow ----------
+// ---------- public calendar (/<slug>) ----------
 
-function BookingFlow({ state, shop }: { state: State; shop: Shop }) {
-  const queryClient = useQueryClient();
-  const today = state.today;
-  const [date, setDate] = useState<string>(today);
-  const [time, setTime] = useState<string | null>(null);
-  const [menuId, setMenuId] = useState<number | null>(null);
-  const [name, setName] = useState("");
-  const [phone, setPhone] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [doneInfo, setDoneInfo] = useState<{
-    date: string;
-    startTime: string;
-    menuName: string;
-    minutes: number;
-    customerName: string;
-  } | null>(null);
-
-  const menus = state.menus.filter((m) => m.shopId === shop.id);
-  const status = dayStatus(shop, state.overrides, date);
-  const menu = menus.find((m) => m.id === menuId) ?? null;
-
-  const slots = useMemo(() => {
-    const out: { t: string; full: boolean; past: boolean }[] = [];
-    const open = toMin(shop.openTime);
-    const close = toMin(shop.closeTime);
-    const nowMin = nowJSTMinutes();
-    for (let s = open; s < close; s += shop.slotMinutes) {
-      const full = coveringCount(state.bookings, shop.id, date, s) >= shop.chairs;
-      const past = date === today && s <= nowMin;
-      out.push({ t: toHHMM(s), full, past });
-    }
-    return out;
-  }, [shop, date, state.bookings, today]);
-
-  const fitsMenu =
-    time !== null && menu !== null
-      ? toMin(time) + menu.minutes <= toMin(shop.closeTime)
-      : null;
-
-  const createMut = useMutation({
-    mutationFn: () =>
-      api.createBooking({
-        shopId: shop.id,
-        menuId: menuId ?? 0,
-        date,
-        startTime: time ?? "",
-        customerName: name.trim(),
-        phone: phone.trim(),
-      }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        // 完了画面は送信した内容そのもので表示する（公開データに氏名は含まれない）
-        if (menu !== null && time !== null) {
-          setDoneInfo({
-            date,
-            startTime: time,
-            menuName: menu.name,
-            minutes: menu.minutes,
-            customerName: name.trim(),
-          });
-        }
-        setError(null);
-        void queryClient.invalidateQueries({ queryKey: ["state"] });
-      } else {
-        setError(res.error ?? "予約できませんでした");
-      }
-    },
-    onError: () => setError("通信に失敗しました。もう一度お試しください"),
+function PublicCalendarPage(props: { slug: string }) {
+  const today = todayJST();
+  const [yearMonth, setYearMonth] = useState(ymOf(today));
+  const [selected, setSelected] = useState<string>(today);
+  const query = useQuery({
+    queryKey: ["calendar", props.slug, yearMonth],
+    queryFn: () => api.getCalendar({ slug: props.slug, yearMonth }),
   });
 
-  const canSubmit =
-    status.open &&
-    time !== null &&
-    menu !== null &&
-    fitsMenu === true &&
-    name.trim().length > 0 &&
-    digits(phone).length >= 10 &&
-    !createMut.isPending;
+  const shop = query.data?.shop ?? null;
+  const overrides = useMemo(() => {
+    const map = new Map<string, Override>();
+    for (const o of query.data?.overrides ?? []) map.set(o.date, o);
+    return map;
+  }, [query.data]);
 
-  if (doneInfo !== null) {
-    const b = doneInfo;
+  useEffect(() => {
+    if (ymOf(selected) !== yearMonth) {
+      setSelected(yearMonth === ymOf(today) ? today : `${yearMonth}-01`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [yearMonth]);
+
+  if (query.isLoading) {
     return (
-      <section className="rounded-[var(--radius)] border-2 border-[var(--green)] bg-[var(--surface)] p-5 text-center">
-        <p className="text-3xl font-bold text-[var(--green)]">予約が完了しました</p>
-        <div className="mt-4 space-y-1 text-lg">
-          <p className="font-bold">{shop.name}</p>
-          <p>{fmtDateJP(b.date)} {b.startTime}〜</p>
-          <p>{b.menuName}（{b.minutes}分）</p>
-          <p>{b.customerName} 様</p>
-        </div>
-        <p className="mt-4 text-base text-[var(--dim)]">
-          当日は時間までにご来店ください。変更・キャンセルは下の「自分の予約を確認」からできます。
-        </p>
-        <button
-          type="button"
-          className={`${bigBtnCls} mt-5`}
-          onClick={() => {
-            setDoneInfo(null);
-            setTime(null);
-            setMenuId(null);
-          }}
-        >
-          続けて予約する
-        </button>
-      </section>
+      <div className="flex min-h-dvh items-center justify-center" style={{ background: "var(--bg)" }}>
+        <p style={{ color: "var(--dim)" }}>読み込み中…</p>
+      </div>
     );
   }
 
+  if (!query.data?.found || !shop) {
+    return (
+      <div
+        className="flex min-h-dvh items-center justify-center px-6"
+        style={{ background: "var(--bg)", color: "var(--text)" }}
+      >
+        <div className="max-w-md text-center">
+          <h1 className="font-display text-2xl font-bold">カレンダーが見つかりません</h1>
+          <p className="mt-4 leading-relaxed" style={{ color: "var(--dim)" }}>
+            このURLのカレンダーは存在しないか、削除されています。お店で配布されたリンクをもう一度ご確認ください。
+          </p>
+          <a
+            href="/"
+            className="mt-8 inline-block rounded-2xl px-6 py-3 font-semibold"
+            style={{ background: "var(--accent)", color: "var(--accent-text)" }}
+          >
+            トップへ
+          </a>
+        </div>
+      </div>
+    );
+  }
+
+  const todayOpen = isOpenDay(shop, overrides, today);
+  const todayOv = overrides.get(today);
+  const todayHours = effectiveHours(shop, todayOv);
+  const now = nowTimeJST();
+  const nowOpen = todayOpen && now >= todayHours.open && now < todayHours.close;
+  const selectedOv = overrides.get(selected);
+  const selectedOpen = isOpenDay(shop, overrides, selected);
+  const selectedHours = effectiveHours(shop, selectedOv);
+  const updatedText = relativeUpdated(shop.updatedAt, today);
+
+  const badge = !todayOpen
+    ? { text: "本日は休業日です", color: "var(--closed)", bg: "var(--closed-bg)", dot: "var(--closed)" }
+    : nowOpen
+      ? { text: "ただいま営業中です", color: "var(--open)", bg: "var(--accent-soft)", dot: "var(--open)" }
+      : now < todayHours.open
+        ? {
+            text: `本日は営業日です（${todayHours.open}から）`,
+            color: "var(--text)",
+            bg: "var(--accent-soft)",
+            dot: "var(--open)",
+          }
+        : {
+            text: "本日の営業は終了しました",
+            color: "var(--dim)",
+            bg: "var(--surface-alt)",
+            dot: "var(--dim)",
+          };
+
   return (
-    <div className="space-y-8">
-      <section>
-        <h2 className="text-2xl font-bold">1. 日付を選ぶ</h2>
-        <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-3 shadow-sm">
-          <MonthCalendar
-            shop={shop}
-            overrides={state.overrides}
-            bookings={state.bookings}
-            today={today}
-            selected={date}
-            onSelect={(d) => {
-              setDate(d);
-              setTime(null);
-            }}
-            showLoad={false}
+    <div data-theme={shop.theme} style={{ background: "var(--bg)", color: "var(--text)" }}>
+      <SafeAreaTopScrim backgroundColor="var(--bg)" />
+      <main className="mx-auto min-h-dvh w-full max-w-xl px-5 pb-16">
+        {/* ヘッダー */}
+        <header className="pt-12 pb-8 text-center">
+          <p
+            className="text-xs font-semibold tracking-[0.35em]"
+            style={{ color: "var(--dim)" }}
+          >
+            営業日カレンダー
+          </p>
+          <h1 className="font-display mt-4 text-4xl leading-snug font-bold break-words">
+            {shop.name}
+          </h1>
+          <div className="mt-6 flex justify-center">
+            <span
+              className="inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold"
+              style={{ background: badge.bg, color: badge.color }}
+            >
+              <span className="h-2 w-2 rounded-full" style={{ background: badge.dot }} />
+              {badge.text}
+            </span>
+          </div>
+          {shop.message ? (
+            <p className="mx-auto mt-7 max-w-md text-base leading-loose whitespace-pre-wrap">
+              {shop.message}
+            </p>
+          ) : null}
+        </header>
+
+        {/* カレンダー */}
+        <Card>
+          <MonthNav
+            yearMonth={yearMonth}
+            onChange={(ym) => setYearMonth(ym)}
           />
-        </div>
-      </section>
-
-      <section>
-        <h2 className="text-2xl font-bold">2. 時間を選ぶ</h2>
-        <p className="mt-1 text-lg font-bold text-[var(--accent)]">{fmtDateJP(date)}</p>
-        {!status.open ? (
-          <p className="mt-3 rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]">
-            この日は{status.label}です。営業日を選んでください。
-          </p>
-        ) : (
-          <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
-            {slots.map((s) => {
-              const disabled = s.full || s.past;
-              const sel = time === s.t;
-              return (
-                <button
-                  key={s.t}
-                  type="button"
-                  disabled={disabled}
-                  onClick={() => setTime(s.t)}
-                  aria-label={`${s.t} ${s.full ? "満席" : s.past ? "受付終了" : "空きあり"}`}
-                  className={[
-                    "flex min-h-16 flex-col items-center justify-center rounded-[var(--radius)] border-2",
-                    sel
-                      ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-text)]"
-                      : "border-[var(--border)] bg-[var(--surface)] text-[var(--text)]",
-                    disabled ? "opacity-40" : "",
-                  ].join(" ")}
-                >
-                  <span className="text-xl font-bold leading-none">{s.t}</span>
-                  <span className={`mt-1 text-sm font-bold ${sel ? "" : s.full ? "text-[var(--red)]" : "text-[var(--green)]"}`}>
-                    {s.full ? "満席" : s.past ? "終了" : "空きあり"}
-                  </span>
-                </button>
-              );
-            })}
+          <CalendarGrid
+            rules={shop}
+            overrides={overrides}
+            yearMonth={yearMonth}
+            today={today}
+            selected={selected}
+            onSelect={setSelected}
+          />
+          <div
+            className="mt-4 flex items-center gap-5 border-t pt-4 text-xs"
+            style={{ borderColor: "var(--border)", color: "var(--dim)" }}
+          >
+            <span className="flex items-center gap-1.5">
+              <span
+                className="inline-block h-3.5 w-3.5 rounded-md"
+                style={{ background: "var(--closed-bg)" }}
+              />
+              休業日
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span
+                className="inline-block h-3.5 w-3.5 rounded-md"
+                style={{ boxShadow: "inset 0 0 0 2px var(--accent)" }}
+              />
+              今日
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span
+                className="inline-block h-1.5 w-1.5 rounded-full"
+                style={{ background: "var(--accent)" }}
+              />
+              お知らせあり
+            </span>
           </div>
-        )}
-      </section>
+        </Card>
 
-      <section>
-        <h2 className="text-2xl font-bold">3. メニューを選ぶ</h2>
-        <div className="mt-3 space-y-2">
-          {menus.map((m) => {
-            const sel = menuId === m.id;
-            const tooLong =
-              time !== null && toMin(time) + m.minutes > toMin(shop.closeTime);
-            return (
-              <button
-                key={m.id}
-                type="button"
-                onClick={() => setMenuId(m.id)}
-                aria-pressed={sel}
-                className={[
-                  "flex w-full min-h-16 items-center justify-between rounded-[var(--radius)] border-2 px-4 py-3 text-left",
-                  sel
-                    ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-text)]"
-                    : "border-[var(--border)] bg-[var(--surface)] text-[var(--text)]",
-                ].join(" ")}
-              >
-                <span>
-                  <span className="block text-xl font-bold">{m.name}</span>
-                  <span className={`text-base ${sel ? "" : "text-[var(--dim)]"}`}>
-                    約{m.minutes}分
-                    {tooLong ? "（選んだ時間では終わりません）" : ""}
-                  </span>
-                </span>
-                <span className="text-xl font-bold">
-                  {m.price !== null ? `¥${m.price.toLocaleString()}` : "料金は店頭で"}
-                </span>
-              </button>
-            );
-          })}
-          {menus.length === 0 && (
-            <p className="text-lg text-[var(--dim)]">メニューが登録されていません。</p>
-          )}
-        </div>
-        {time !== null && menu !== null && fitsMenu === false && (
-          <p className="mt-2 text-lg font-bold text-[var(--red)]">
-            「{menu.name}」は {time} からでは営業時間内に終わりません。早い時間を選んでください。
-          </p>
-        )}
-      </section>
-
-      <section>
-        <h2 className="text-2xl font-bold">4. お名前と電話番号</h2>
-        <div className="mt-3 space-y-4">
-          <div>
-            <label htmlFor="bf-name" className={labelCls}>お名前</label>
-            <input
-              id="bf-name"
-              className={inputCls}
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="例：山田 太郎"
-              autoComplete="name"
-            />
-          </div>
-          <div>
-            <label htmlFor="bf-phone" className={labelCls}>電話番号（予約の確認・キャンセルに使います）</label>
-            <input
-              id="bf-phone"
-              className={inputCls}
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              placeholder="例：09012345678"
-              inputMode="tel"
-              autoComplete="tel"
-            />
-          </div>
-        </div>
-        {error && (
-          <p className="mt-3 rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]">
-            {error}
-          </p>
-        )}
-        <button
-          type="button"
-          className={`${bigBtnCls} mt-5`}
-          disabled={!canSubmit}
-          onClick={() => createMut.mutate()}
+        {/* 選択日の詳細 */}
+        <section
+          className="mt-4 rounded-[28px] p-5 sm:p-6"
+          style={{ background: "var(--surface-alt)" }}
         >
-          {createMut.isPending ? "予約しています…" : "この内容で予約する"}
-        </button>
-        {!canSubmit && (
-          <p className="mt-2 text-center text-base text-[var(--dim)]">
-            日付・時間・メニュー・お名前・電話番号をすべて入れると押せます
+          <h3 className="text-base font-bold">{dateLabel(selected)}</h3>
+          <p className="mt-2 leading-relaxed">
+            {selectedOpen ? (
+              <>
+                営業日です
+                <span className="tnum ml-2">
+                  {selectedHours.open}〜{selectedHours.close}
+                </span>
+                {selectedHours.custom ? (
+                  <span className="ml-2 text-sm" style={{ color: "var(--dim)" }}>
+                    （この日は時間が変わります）
+                  </span>
+                ) : null}
+              </>
+            ) : (
+              <span style={{ color: "var(--closed)" }}>休業日です</span>
+            )}
           </p>
-        )}
-      </section>
+          {selectedOv?.note ? (
+            <p className="mt-3 leading-relaxed whitespace-pre-wrap">{selectedOv.note}</p>
+          ) : null}
+        </section>
+
+        {/* お店の案内 */}
+        <section className="mt-10 space-y-4 px-1">
+          <h3
+            className="text-xs font-semibold tracking-[0.3em]"
+            style={{ color: "var(--dim)" }}
+          >
+            お店のご案内
+          </h3>
+          <dl className="space-y-3 text-base">
+            <div className="flex gap-4">
+              <dt className="w-20 shrink-0" style={{ color: "var(--dim)" }}>
+                営業時間
+              </dt>
+              <dd className="tnum">
+                {shop.openTime}〜{shop.closeTime}
+              </dd>
+            </div>
+            <div className="flex gap-4">
+              <dt className="w-20 shrink-0" style={{ color: "var(--dim)" }}>
+                定休日
+              </dt>
+              <dd>{closedRuleText(shop)}</dd>
+            </div>
+            {shop.address ? (
+              <div className="flex gap-4">
+                <dt className="w-20 shrink-0" style={{ color: "var(--dim)" }}>
+                  住所
+                </dt>
+                <dd className="break-words">{shop.address}</dd>
+              </div>
+            ) : null}
+            {shop.phone ? (
+              <div className="flex gap-4">
+                <dt className="w-20 shrink-0" style={{ color: "var(--dim)" }}>
+                  電話
+                </dt>
+                <dd>
+                  <a href={`tel:${shop.phone}`} className="tnum underline underline-offset-4">
+                    {shop.phone}
+                  </a>
+                </dd>
+              </div>
+            ) : null}
+          </dl>
+          {shop.instagramUrl ? (
+            <a
+              href={shop.instagramUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 flex min-h-14 items-center justify-center rounded-2xl border text-base font-semibold"
+              style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
+            >
+              Instagramを見る
+            </a>
+          ) : null}
+        </section>
+
+        {/* 最終更新 */}
+        {updatedText ? (
+          <p className="mt-12 text-center text-sm" style={{ color: "var(--dim)" }}>
+            最終更新：{updatedText}
+          </p>
+        ) : null}
+        <p className="mt-3 text-center text-xs tracking-widest" style={{ color: "var(--dim)" }}>
+          営業日カレンダー
+        </p>
+      </main>
     </div>
   );
 }
 
-// ---------- customer: my bookings ----------
+// ---------- landing (/) ----------
 
-function MyBookings({ shop }: { shop: Shop }) {
-  const queryClient = useQueryClient();
-  const [phoneInput, setPhoneInput] = useState("");
-  const [searched, setSearched] = useState<string | null>(null);
-  const [mine, setMine] = useState<FullBooking[]>([]);
-  const [confirmId, setConfirmId] = useState<number | null>(null);
-  const [msg, setMsg] = useState<string | null>(null);
-
-  // 自分の予約は電話番号をサーバーに送って、この店舗の範囲だけで検索する
-  // （全員の予約は端末に渡らない）
-  const searchMut = useMutation({
-    mutationFn: (phone: string) => api.lookupMyBookings({ shopId: shop.id, phone }),
-    onSuccess: (res) => {
-      setMine(res.bookings);
-    },
-    onError: () => setMsg("通信に失敗しました"),
-  });
-
-  const cancelMut = useMutation({
-    mutationFn: (b: FullBooking) => api.cancelBooking({ id: b.id, phone: searched ?? "" }),
-    onSuccess: (res, b) => {
-      if (res.ok) {
-        setMsg("予約を取り消しました");
-        setConfirmId(null);
-        setMine((prev) => prev.filter((x) => x.id !== b.id));
-        void queryClient.invalidateQueries({ queryKey: ["state"] });
-      } else {
-        setMsg(res.error ?? "取り消せませんでした");
-      }
-    },
-    onError: () => setMsg("通信に失敗しました"),
-  });
-
+function LandingPage() {
   return (
-    <section className="mt-10">
-      <h2 className="text-2xl font-bold">自分の予約を確認・キャンセル</h2>
-      <p className="mt-1 text-base text-[var(--dim)]">
-        予約したときの電話番号を入れると、自分の予約が表示されます。
-      </p>
-      <div className="mt-3 flex gap-2">
-        <input
-          aria-label="予約確認用の電話番号"
-          className={inputCls}
-          value={phoneInput}
-          onChange={(e) => setPhoneInput(e.target.value)}
-          placeholder="電話番号"
-          inputMode="tel"
-        />
-        <button
-          type="button"
-          className="min-h-14 shrink-0 rounded-[var(--radius)] bg-[var(--accent)] px-5 text-xl font-bold text-[var(--accent-text)] disabled:opacity-40"
-          disabled={digits(phoneInput).length < 10 || searchMut.isPending}
-          onClick={() => {
-            setSearched(phoneInput);
-            setMsg(null);
-            setConfirmId(null);
-            searchMut.mutate(phoneInput);
-          }}
-        >
-          {searchMut.isPending ? "検索中…" : "確認"}
-        </button>
-      </div>
-      {msg && <p className="mt-3 text-lg font-bold text-[var(--green)]">{msg}</p>}
-      {searched !== null && (
-        <div className="mt-4 space-y-3">
-          {mine.length === 0 && !searchMut.isPending && (
-            <p className="text-lg text-[var(--dim)]">この電話番号の今後の予約は、{shop.name}にはありません。</p>
-          )}
-          {mine.map((b) => {
-            return (
-              <div key={b.id} className="rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] p-4">
-                <p className="mt-1 text-lg">
-                  {fmtDateJP(b.date)} {b.startTime}〜{toHHMM(toMin(b.startTime) + b.minutes)}
-                </p>
-                <p className="text-lg">{b.menuName}（{b.minutes}分）／{b.customerName} 様</p>
-                {confirmId === b.id ? (
-                  <div className="mt-3 flex gap-2">
-                    <button
-                      type="button"
-                      className="min-h-12 flex-1 rounded-[var(--radius)] bg-[var(--red)] px-3 text-lg font-bold text-white"
-                      onClick={() => cancelMut.mutate(b)}
-                    >
-                      本当に取り消す
-                    </button>
-                    <button
-                      type="button"
-                      className="min-h-12 flex-1 rounded-[var(--radius)] bg-[var(--surface-alt)] px-3 text-lg font-bold"
-                      onClick={() => setConfirmId(null)}
-                    >
-                      やめる
-                    </button>
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    className="mt-3 min-h-12 w-full rounded-[var(--radius)] border-2 border-[var(--red)] px-3 text-lg font-bold text-[var(--red)]"
-                    onClick={() => setConfirmId(b.id)}
-                  >
-                    この予約を取り消す
-                  </button>
-                )}
-              </div>
-            );
-          })}
+    <div style={{ background: "var(--bg)", color: "var(--text)" }}>
+      <SafeAreaTopScrim backgroundColor="var(--bg)" />
+      <main className="mx-auto min-h-dvh w-full max-w-xl px-5 pb-16">
+        <header className="pt-16 pb-10 text-center">
+          <p className="text-xs font-semibold tracking-[0.35em]" style={{ color: "var(--dim)" }}>
+            個人店のための
+          </p>
+          <h1 className="font-display mt-4 text-4xl leading-snug font-bold">営業日カレンダー</h1>
+          <p className="mx-auto mt-6 max-w-md leading-loose" style={{ color: "var(--dim)" }}>
+            お店の営業日を、リンクひとつでお知らせ。
+            <br />
+            Instagram・公式LINE・ホームページに貼るだけ。
+            <br />
+            急なお休みも、スマホからすぐに反映できます。
+          </p>
+        </header>
+
+        <div className="space-y-3">
+          <a href="/signup" className="block">
+            <PrimaryButton>新規登録をはじめる</PrimaryButton>
+          </a>
+          <a href="/login" className="block">
+            <GhostButton>ログイン</GhostButton>
+          </a>
         </div>
-      )}
-    </section>
-  );
-}
 
-// ---------- owner: booking list + manual add ----------
-
-function OwnerBookings({ state, shop, ownerPin }: { state: State; shop: Shop; ownerPin: string }) {
-  const queryClient = useQueryClient();
-  const [range, setRange] = useState<"today" | "week">("today");
-  const [confirmId, setConfirmId] = useState<number | null>(null);
-
-  // manual add form
-  const menus = state.menus.filter((m) => m.shopId === shop.id);
-  const [mDate, setMDate] = useState(state.today);
-  const [mTime, setMTime] = useState("10:00");
-  const [mMenuId, setMMenuId] = useState<number>(menus[0]?.id ?? 0);
-  const [mName, setMName] = useState("");
-  const [mPhone, setMPhone] = useState("");
-  const [mMsg, setMMsg] = useState<string | null>(null);
-  const [mError, setMError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (mMenuId === 0 && menus.length > 0) setMMenuId(menus[0]?.id ?? 0);
-  }, [menus, mMenuId]);
-
-  // 氏名・電話番号つきの予約一覧は、暗証番号認証後の専用取得でのみ読み込む
-  const ownerBookingsQ = useQuery({
-    queryKey: ["ownerBookings", shop.id],
-    queryFn: () => api.getOwnerBookings({ shopId: shop.id, ownerPin }),
-  });
-  const invalidateAll = () => {
-    void queryClient.invalidateQueries({ queryKey: ["state"] });
-    void queryClient.invalidateQueries({ queryKey: ["ownerBookings", shop.id] });
-  };
-
-  const endDate = range === "today" ? state.today : addDays(state.today, 6);
-  const list = (ownerBookingsQ.data?.bookings ?? [])
-    .filter(
-      (b) =>
-        b.status === "booked" &&
-        b.date >= state.today &&
-        b.date <= endDate,
-    )
-    .sort((a, b) => (a.date + a.startTime).localeCompare(b.date + b.startTime));
-
-  const dates: string[] = [];
-  for (const b of list) if (!dates.includes(b.date)) dates.push(b.date);
-
-  const [cancelError, setCancelError] = useState<string | null>(null);
-  const cancelMut = useMutation({
-    mutationFn: (id: number) => api.cancelBooking({ id, ownerPin }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        setConfirmId(null);
-        setCancelError(null);
-        invalidateAll();
-      } else {
-        setCancelError(res.error ?? "取り消せませんでした");
-      }
-    },
-    onError: () => setCancelError("通信に失敗しました"),
-  });
-
-  const addMut = useMutation({
-    mutationFn: () =>
-      api.createBooking({
-        shopId: shop.id,
-        menuId: mMenuId,
-        date: mDate,
-        startTime: mTime,
-        customerName: mName.trim(),
-        phone: mPhone.trim(),
-      }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        setMMsg("予約を追加しました");
-        setMError(null);
-        setMName("");
-        setMPhone("");
-        invalidateAll();
-      } else {
-        setMError(res.error ?? "追加できませんでした");
-        setMMsg(null);
-      }
-    },
-    onError: () => setMError("通信に失敗しました"),
-  });
-
-  const slotOptions: string[] = [];
-  for (let s = toMin(shop.openTime); s < toMin(shop.closeTime); s += shop.slotMinutes) {
-    slotOptions.push(toHHMM(s));
-  }
-
-  return (
-    <div className="space-y-8">
-      <section>
-        <div className="flex gap-2" role="tablist" aria-label="予約一覧の範囲">
-          {(["today", "week"] as const).map((r) => (
-            <button
-              key={r}
-              type="button"
-              role="tab"
-              aria-selected={range === r}
-              onClick={() => setRange(r)}
-              className={`min-h-12 flex-1 rounded-[var(--radius)] text-lg font-bold ${
-                range === r
-                  ? "bg-[var(--accent)] text-[var(--accent-text)]"
-                  : "bg-[var(--surface-alt)] text-[var(--text)]"
-              }`}
-            >
-              {r === "today" ? "今日の予約" : "今週の予約"}
-            </button>
+        <div className="mt-12 space-y-4">
+          {[
+            {
+              title: "リンクを貼るだけ",
+              body: "登録するとあなたのお店専用のURLが発行されます。あとはそのリンクをプロフィールや投稿に貼るだけです。",
+            },
+            {
+              title: "急な変更も即反映",
+              body: "「今日はお休み」も、営業日の画像を作り直す必要はありません。スマホでカレンダーをタップすれば、その場で反映されます。",
+            },
+            {
+              title: "最終更新が見える",
+              body: "カレンダーには最終更新日が表示されます。お客さんは「ちゃんと更新されている」ことが分かり、安心して見られます。",
+            },
+          ].map((f) => (
+            <Card key={f.title}>
+              <h2 className="text-lg font-bold">{f.title}</h2>
+              <p className="mt-2 leading-relaxed" style={{ color: "var(--dim)" }}>
+                {f.body}
+              </p>
+            </Card>
           ))}
         </div>
 
-        {cancelError && (
-          <p className="mt-3 rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]">
-            {cancelError}
-          </p>
-        )}
-        {ownerBookingsQ.isPending && (
-          <p className="mt-4 text-center text-lg text-[var(--dim)]">予約を読み込んでいます…</p>
-        )}
-        {ownerBookingsQ.error && (
-          <p className="mt-3 rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]">
-            予約一覧を読み込めませんでした。ロックして入り直してください。
-          </p>
-        )}
-        <div className="mt-4 space-y-5">
-          {list.length === 0 && !ownerBookingsQ.isPending && !ownerBookingsQ.error && (
-            <p className="rounded-[var(--radius)] bg-[var(--surface)] p-5 text-center text-lg text-[var(--dim)]">
-              {range === "today" ? "今日の予約はまだありません。" : "今週の予約はまだありません。"}
+        <p className="mt-12 text-center text-xs tracking-widest" style={{ color: "var(--dim)" }}>
+          営業日カレンダー
+        </p>
+      </main>
+    </div>
+  );
+}
+
+// ---------- auth (login / signup) ----------
+
+function AuthShell(props: { title: string; children: React.ReactNode }) {
+  return (
+    <div style={{ background: "var(--bg)", color: "var(--text)" }}>
+      <SafeAreaTopScrim backgroundColor="var(--bg)" />
+      <main className="mx-auto min-h-dvh w-full max-w-xl px-5 pt-14 pb-16">
+        <p className="text-center text-xs font-semibold tracking-[0.35em]" style={{ color: "var(--dim)" }}>
+          営業日カレンダー
+        </p>
+        <h1 className="font-display mt-3 text-center text-3xl font-bold">{props.title}</h1>
+        <div className="mt-10">
+          <Card>{props.children}</Card>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function SignupPage() {
+  const [slug, setSlug] = useState("");
+  const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await api.signup({ slug: slug.trim(), name, password });
+      if (!res.ok) {
+        setError(res.error ?? "登録に失敗しました");
+        return;
+      }
+      if (res.editToken && res.slug) {
+        try {
+          sessionStorage.setItem(`editToken:${res.slug}`, res.editToken);
+        } catch {
+          // 保存できなくても編集画面は使える
+        }
+      }
+      window.location.assign(`/${res.slug}/edit`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "登録に失敗しました");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <AuthShell title="新規登録">
+      <form onSubmit={submit} className="space-y-5">
+        <TextInput label="お店の名前" value={name} onChange={setName} autoComplete="organization" />
+        <TextInput
+          label="ID（公開URLになります）"
+          value={slug}
+          onChange={(v) => setSlug(v.toLowerCase())}
+          autoComplete="username"
+          placeholder="例：cut-kattyan"
+          hint={`英小文字・数字・ハイフン・アンダースコア、3〜30字。公開URLは /${slug.trim() || "your-id"} になります`}
+        />
+        <TextInput
+          label="パスワード"
+          type="password"
+          value={password}
+          onChange={setPassword}
+          autoComplete="new-password"
+          hint="8文字以上で設定してください"
+        />
+        <ErrorBox message={error} />
+        <PrimaryButton type="submit" disabled={busy}>
+          登録してカレンダーを作る
+        </PrimaryButton>
+        <p className="text-center text-sm" style={{ color: "var(--dim)" }}>
+          すでに登録済みの方は{" "}
+          <a href="/login" className="underline underline-offset-4">
+            ログイン
+          </a>
+        </p>
+      </form>
+    </AuthShell>
+  );
+}
+
+function LoginPage() {
+  const [slug, setSlug] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await api.login({ slug: slug.trim(), password });
+      if (!res.ok) {
+        setError(res.error ?? "ログインに失敗しました");
+        return;
+      }
+      window.location.assign(`/${res.slug}/edit`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "ログインに失敗しました");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <AuthShell title="ログイン">
+      <form onSubmit={submit} className="space-y-5">
+        <TextInput
+          label="ID"
+          value={slug}
+          onChange={(v) => setSlug(v.toLowerCase())}
+          autoComplete="username"
+          placeholder="例：cut-kattyan"
+        />
+        <TextInput
+          label="パスワード"
+          type="password"
+          value={password}
+          onChange={setPassword}
+          autoComplete="current-password"
+        />
+        <ErrorBox message={error} />
+        <PrimaryButton type="submit" disabled={busy}>
+          ログイン
+        </PrimaryButton>
+        <p className="text-center text-sm" style={{ color: "var(--dim)" }}>
+          編集リンクをお持ちの方は、そのリンクを開くだけで編集できます
+        </p>
+      </form>
+    </AuthShell>
+  );
+}
+
+// ---------- edit link redemption (/<slug>/<uuid>) ----------
+
+function RedeemPage(props: { slug: string; token: string }) {
+  const [error, setError] = useState<string | null>(null);
+  const done = useRef(false);
+
+  useEffect(() => {
+    if (done.current) return;
+    done.current = true;
+    (async () => {
+      try {
+        const res = await api.redeemEditLink({ slug: props.slug, token: props.token });
+        if (res.ok) {
+          try {
+            sessionStorage.setItem(`editToken:${props.slug}`, props.token);
+          } catch {
+            // ignore
+          }
+          window.location.replace(`/${props.slug}/edit`);
+        } else {
+          setError(res.error ?? "この編集リンクは無効です");
+        }
+      } catch {
+        setError("この編集リンクは無効です");
+      }
+    })();
+  }, [props.slug, props.token]);
+
+  return (
+    <div
+      className="flex min-h-dvh items-center justify-center px-6"
+      style={{ background: "var(--bg)", color: "var(--text)" }}
+    >
+      <div className="max-w-md text-center">
+        {error ? (
+          <>
+            <h1 className="font-display text-2xl font-bold">編集リンクが無効です</h1>
+            <p className="mt-4 leading-relaxed" style={{ color: "var(--dim)" }}>
+              リンクが再発行されて古くなっている可能性があります。IDとパスワードでログインするか、お店の公開カレンダーをご覧ください。
             </p>
-          )}
-          {dates.map((d) => (
-            <div key={d}>
-              <h3 className="text-xl font-bold">
-                {fmtDateJP(d)}
-                {d === state.today ? "（今日）" : ""}
-                <span className="ml-2 text-base text-[var(--dim)]">
-                  {list.filter((b) => b.date === d).length}件
+            <div className="mt-8 space-y-3">
+              <a href="/login" className="block">
+                <PrimaryButton>ログインする</PrimaryButton>
+              </a>
+              <a href={`/${props.slug}`} className="block">
+                <GhostButton>公開カレンダーを見る</GhostButton>
+              </a>
+            </div>
+          </>
+        ) : (
+          <p style={{ color: "var(--dim)" }}>編集画面を開いています…</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- edit page (/<slug>/edit) ----------
+
+type ThemeKey = "standard" | "warm" | "sakura" | "forest" | "ocean" | "mono";
+
+function EditPage(props: { slug: string }) {
+  const queryClient = useQueryClient();
+  const today = todayJST();
+  const [yearMonth, setYearMonth] = useState(ymOf(today));
+  const [selected, setSelected] = useState<string>(today);
+
+  const sessionQ = useQuery({
+    queryKey: ["session"],
+    queryFn: () => api.getSession({}),
+  });
+  const canEdit = sessionQ.data?.loggedIn === true && sessionQ.data.slug === props.slug;
+
+  const editQ = useQuery({
+    queryKey: ["edit", props.slug, yearMonth],
+    queryFn: () => api.getEditState({ slug: props.slug, yearMonth }),
+    enabled: canEdit,
+  });
+
+  const shop = editQ.data?.shop ?? null;
+  const scope = editQ.data?.scope ?? sessionQ.data?.scope ?? null;
+  const overrides = useMemo(() => {
+    const map = new Map<string, Override>();
+    for (const o of editQ.data?.overrides ?? []) map.set(o.date, o);
+    return map;
+  }, [editQ.data]);
+
+  // --- profile form state (initialized once per shop) ---
+  const [formReadyFor, setFormReadyFor] = useState<string | null>(null);
+  const [name, setName] = useState("");
+  const [address, setAddress] = useState("");
+  const [phone, setPhone] = useState("");
+  const [openTime, setOpenTime] = useState("09:00");
+  const [closeTime, setCloseTime] = useState("19:00");
+  const [message, setMessage] = useState("");
+  const [instagramUrl, setInstagramUrl] = useState("");
+  const [theme, setTheme] = useState<ThemeKey>("standard");
+  const [closedWeekdays, setClosedWeekdays] = useState<number[]>([]);
+  const [nthClosures, setNthClosures] = useState<{ nth: number; weekday: number }[]>([]);
+  const [profileMsg, setProfileMsg] = useState<string | null>(null);
+  const [profileErr, setProfileErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (shop && formReadyFor !== shop.slug) {
+      setName(shop.name);
+      setAddress(shop.address);
+      setPhone(shop.phone);
+      setOpenTime(shop.openTime);
+      setCloseTime(shop.closeTime);
+      setMessage(shop.message);
+      setInstagramUrl(shop.instagramUrl);
+      setTheme((THEME_OPTIONS.some((t) => t.key === shop.theme) ? shop.theme : "standard") as ThemeKey);
+      setClosedWeekdays(shop.closedWeekdays);
+      setNthClosures(shop.nthClosures);
+      setFormReadyFor(shop.slug);
+    }
+  }, [shop, formReadyFor]);
+
+  // --- selected-day panel state ---
+  const selectedOv = overrides.get(selected);
+  const selectedOpen = shop ? isOpenDay(shop, overrides, selected) : false;
+  const [noteDraft, setNoteDraft] = useState("");
+  const [useCustomHours, setUseCustomHours] = useState(false);
+  const [hoursOpen, setHoursOpen] = useState("09:00");
+  const [hoursClose, setHoursClose] = useState("19:00");
+
+  useEffect(() => {
+    setNoteDraft(selectedOv?.note ?? "");
+    if (selectedOv?.hours) {
+      const [o = "09:00", c = "19:00"] = selectedOv.hours.split("-");
+      setHoursOpen(o);
+      setHoursClose(c);
+      setUseCustomHours(true);
+    } else {
+      setUseCustomHours(false);
+      if (shop) {
+        setHoursOpen(shop.openTime);
+        setHoursClose(shop.closeTime);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, editQ.data]);
+
+  // --- edit link state ---
+  const [editToken, setEditToken] = useState<string | null>(() => {
+    try {
+      return sessionStorage.getItem(`editToken:${props.slug}`);
+    } catch {
+      return null;
+    }
+  });
+  const [confirmReissue, setConfirmReissue] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  async function copyText(key: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(key);
+      window.setTimeout(() => setCopied((c) => (c === key ? null : c)), 2000);
+    } catch {
+      setCopied(null);
+    }
+  }
+
+  // --- password change state ---
+  const [currentPw, setCurrentPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [pwMsg, setPwMsg] = useState<string | null>(null);
+  const [pwErr, setPwErr] = useState<string | null>(null);
+
+  const invalidate = () => {
+    void queryClient.invalidateQueries();
+  };
+
+  const dayMutation = useMutation({
+    mutationFn: (args: Parameters<typeof api.setDayOverride>[0]) => api.setDayOverride(args),
+    onSuccess: invalidate,
+  });
+
+  const profileMutation = useMutation({
+    mutationFn: (args: Parameters<typeof api.updateProfile>[0]) => api.updateProfile(args),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setProfileErr(null);
+        setProfileMsg("保存しました");
+        invalidate();
+      } else {
+        setProfileMsg(null);
+        setProfileErr(res.error ?? "保存に失敗しました");
+      }
+    },
+    onError: (err) => setProfileErr(err instanceof Error ? err.message : "保存に失敗しました"),
+  });
+
+  const pwMutation = useMutation({
+    mutationFn: (args: Parameters<typeof api.changePassword>[0]) => api.changePassword(args),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setPwErr(null);
+        setPwMsg("パスワードを変更しました");
+        setCurrentPw("");
+        setNewPw("");
+      } else {
+        setPwMsg(null);
+        setPwErr(res.error ?? "変更に失敗しました");
+      }
+    },
+    onError: (err) => setPwErr(err instanceof Error ? err.message : "変更に失敗しました"),
+  });
+
+  const reissueMutation = useMutation({
+    mutationFn: () => api.reissueEditToken({ slug: props.slug }),
+    onSuccess: (res) => {
+      if (res.ok && res.editToken) {
+        setEditToken(res.editToken);
+        try {
+          sessionStorage.setItem(`editToken:${props.slug}`, res.editToken);
+        } catch {
+          // ignore
+        }
+      }
+      setConfirmReissue(false);
+    },
+  });
+
+  // --- gates ---
+  if (sessionQ.isLoading) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center" style={{ background: "var(--bg)" }}>
+        <p style={{ color: "var(--dim)" }}>読み込み中…</p>
+      </div>
+    );
+  }
+  if (!canEdit) {
+    return (
+      <div style={{ background: "var(--bg)", color: "var(--text)" }}>
+        <SafeAreaTopScrim backgroundColor="var(--bg)" />
+        <main className="mx-auto flex min-h-dvh w-full max-w-xl items-center px-5">
+          <Card className="w-full">
+            <h1 className="font-display text-2xl font-bold">編集にはログインが必要です</h1>
+            <p className="mt-4 leading-relaxed" style={{ color: "var(--dim)" }}>
+              このカレンダーを編集するには、IDとパスワードでログインするか、お店専用の編集リンクを開いてください。
+            </p>
+            <div className="mt-6 space-y-3">
+              <a href="/login" className="block">
+                <PrimaryButton>ログインする</PrimaryButton>
+              </a>
+              <a href={`/${props.slug}`} className="block">
+                <GhostButton>公開カレンダーを見る</GhostButton>
+              </a>
+            </div>
+          </Card>
+        </main>
+      </div>
+    );
+  }
+  if (editQ.isLoading || !shop) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center" style={{ background: "var(--bg)" }}>
+        <p style={{ color: "var(--dim)" }}>読み込み中…</p>
+      </div>
+    );
+  }
+
+  const origin = window.location.origin;
+  const publicUrl = `${origin}/${props.slug}`;
+  const editUrl = editToken ? `${origin}/${props.slug}/${editToken}` : null;
+
+  function handleDayTap(date: string) {
+    setSelected(date);
+    if (!shop) return;
+    const open = isOpenDay(shop, overrides, date);
+    const ov = overrides.get(date);
+    dayMutation.mutate({
+      slug: props.slug,
+      date,
+      kind: open ? "closed" : "open",
+      note: ov?.note ?? "",
+      hours: ov?.hours ?? "",
+    });
+  }
+
+  function saveDayDetails() {
+    dayMutation.mutate({
+      slug: props.slug,
+      date: selected,
+      kind: selectedOpen ? "open" : "closed",
+      note: noteDraft,
+      hours: useCustomHours ? `${hoursOpen}-${hoursClose}` : "",
+    });
+  }
+
+  function clearDayOverride() {
+    dayMutation.mutate({ slug: props.slug, date: selected, kind: "clear", note: "", hours: "" });
+  }
+
+  function saveProfile() {
+    setProfileMsg(null);
+    setProfileErr(null);
+    profileMutation.mutate({
+      slug: props.slug,
+      name,
+      address,
+      phone,
+      openTime,
+      closeTime,
+      closedWeekdays,
+      nthClosures,
+      message,
+      theme,
+      instagramUrl,
+    });
+  }
+
+  async function logout() {
+    try {
+      await api.logout({});
+    } catch {
+      // ignore
+    }
+    window.location.assign(`/${props.slug}`);
+  }
+
+  return (
+    <div data-theme={theme} style={{ background: "var(--bg)", color: "var(--text)" }}>
+      <SafeAreaTopScrim backgroundColor="var(--bg)" />
+      <main className="mx-auto min-h-dvh w-full max-w-xl px-5 pt-10 pb-16">
+        <header className="mb-8">
+          <p className="text-xs font-semibold tracking-[0.35em]" style={{ color: "var(--dim)" }}>
+            カレンダーの編集
+          </p>
+          <h1 className="font-display mt-3 text-3xl font-bold break-words">{shop.name}</h1>
+          <a
+            href={`/${props.slug}`}
+            className="mt-3 inline-block text-sm underline underline-offset-4"
+            style={{ color: "var(--dim)" }}
+          >
+            公開カレンダーを見る（/{props.slug}）
+          </a>
+        </header>
+
+        {/* カレンダー編集 */}
+        <Card>
+          <MonthNav yearMonth={yearMonth} onChange={setYearMonth} />
+          <CalendarGrid
+            rules={shop}
+            overrides={overrides}
+            yearMonth={yearMonth}
+            today={today}
+            selected={selected}
+            onSelect={handleDayTap}
+          />
+          <p className="mt-4 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+            日付をタップすると営業日／休業日が切り替わります。
+          </p>
+
+          <div
+            className="mt-5 border-t pt-5"
+            style={{ borderColor: "var(--border)" }}
+          >
+            <h3 className="text-base font-bold">{dateLabel(selected)}</h3>
+            <p className="mt-1 text-sm" style={{ color: selectedOpen ? "var(--open)" : "var(--closed)" }}>
+              {selectedOpen ? "営業日" : "休業日"}
+              {selectedOv ? "（個別に設定中）" : "（定休日ルール通り）"}
+            </p>
+            <div className="mt-4 space-y-4">
+              <TextInput
+                label="この日のメモ（公開カレンダーに表示）"
+                value={noteDraft}
+                onChange={setNoteDraft}
+                placeholder="例：午後から営業します"
+              />
+              <div>
+                <span
+                  className="mb-2 block text-sm font-semibold tracking-wide"
+                  style={{ color: "var(--dim)" }}
+                >
+                  この日の営業時間
                 </span>
-              </h3>
-              <div className="mt-2 space-y-2">
-                {list
-                  .filter((b) => b.date === d)
-                  .map((b) => (
-                    <div key={b.id} className="rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] p-4">
+                <label className="flex min-h-12 items-center gap-3 text-base">
+                  <input
+                    type="checkbox"
+                    checked={useCustomHours}
+                    onChange={(e) => setUseCustomHours(e.target.checked)}
+                    className="h-6 w-6"
+                  />
+                  通常と違う時間にする
+                </label>
+                {useCustomHours ? (
+                  <div className="mt-2 flex items-center gap-3">
+                    <input
+                      type="time"
+                      value={hoursOpen}
+                      onChange={(e) => setHoursOpen(e.target.value)}
+                      className="tnum min-h-14 flex-1 rounded-2xl border px-4 text-base"
+                      style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }}
+                    />
+                    <span>〜</span>
+                    <input
+                      type="time"
+                      value={hoursClose}
+                      onChange={(e) => setHoursClose(e.target.value)}
+                      className="tnum min-h-14 flex-1 rounded-2xl border px-4 text-base"
+                      style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }}
+                    />
+                  </div>
+                ) : null}
+              </div>
+              <div className="flex gap-3">
+                <div className="flex-1">
+                  <PrimaryButton onClick={saveDayDetails} disabled={dayMutation.isPending}>
+                    この日の内容を保存
+                  </PrimaryButton>
+                </div>
+                {selectedOv ? (
+                  <div className="flex-1">
+                    <GhostButton onClick={clearDayOverride} disabled={dayMutation.isPending}>
+                      個別設定を解除
+                    </GhostButton>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </Card>
+
+        {/* お店の設定 */}
+        <Card className="mt-6">
+          <h2 className="text-lg font-bold">お店の設定</h2>
+          <div className="mt-5 space-y-5">
+            <TextInput label="お店の名前" value={name} onChange={setName} />
+            <label className="block">
+              <span className="mb-2 block text-sm font-semibold tracking-wide" style={{ color: "var(--dim)" }}>
+                店主の一言（公開カレンダーに表示）
+              </span>
+              <textarea
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                rows={3}
+                className="w-full rounded-2xl border px-4 py-3 text-base leading-relaxed outline-none"
+                style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }}
+                placeholder="例：いつもありがとうございます。ご来店お待ちしております。"
+              />
+            </label>
+            <div className="flex gap-3">
+              <div className="flex-1">
+                <TextInput label="開店時間" type="time" value={openTime} onChange={setOpenTime} />
+              </div>
+              <div className="flex-1">
+                <TextInput label="閉店時間" type="time" value={closeTime} onChange={setCloseTime} />
+              </div>
+            </div>
+            <div>
+              <span className="mb-2 block text-sm font-semibold tracking-wide" style={{ color: "var(--dim)" }}>
+                定休日（毎週）
+              </span>
+              <div className="flex flex-wrap gap-2">
+                {WEEKDAY_LABELS.map((w, i) => {
+                  const active = closedWeekdays.includes(i);
+                  return (
+                    <button
+                      key={w}
+                      type="button"
+                      onClick={() =>
+                        setClosedWeekdays(active ? closedWeekdays.filter((d) => d !== i) : [...closedWeekdays, i])
+                      }
+                      className="min-h-12 min-w-12 rounded-full px-4 text-base font-semibold"
+                      style={{
+                        background: active ? "var(--closed-bg)" : "var(--surface-alt)",
+                        color: active ? "var(--closed)" : "var(--text)",
+                      }}
+                    >
+                      {w}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div>
+              <span className="mb-2 block text-sm font-semibold tracking-wide" style={{ color: "var(--dim)" }}>
+                定休日（第○曜日）
+              </span>
+              <div className="space-y-2">
+                {nthClosures.map((c, idx) => (
+                  <div key={idx} className="flex items-center gap-2">
+                    <select
+                      value={c.nth}
+                      onChange={(e) =>
+                        setNthClosures(nthClosures.map((x, i) => (i === idx ? { ...x, nth: Number(e.target.value) } : x)))
+                      }
+                      className="tnum min-h-12 rounded-xl border px-3 text-base"
+                      style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }}
+                    >
+                      {[1, 2, 3, 4, 5].map((n) => (
+                        <option key={n} value={n}>
+                          第{n}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={c.weekday}
+                      onChange={(e) =>
+                        setNthClosures(nthClosures.map((x, i) => (i === idx ? { ...x, weekday: Number(e.target.value) } : x)))
+                      }
+                      className="min-h-12 rounded-xl border px-3 text-base"
+                      style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }}
+                    >
+                      {WEEKDAY_LABELS.map((w, i) => (
+                        <option key={w} value={i}>
+                          {w}曜日
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => setNthClosures(nthClosures.filter((_, i) => i !== idx))}
+                      className="min-h-12 rounded-xl px-4 text-sm font-semibold"
+                      style={{ background: "var(--closed-bg)", color: "var(--closed)" }}
+                    >
+                      削除
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => setNthClosures([...nthClosures, { nth: 2, weekday: 2 }])}
+                  className="min-h-12 rounded-xl px-4 text-sm font-semibold"
+                  style={{ background: "var(--surface-alt)", color: "var(--text)" }}
+                >
+                  ＋ 第○曜日の定休日を追加
+                </button>
+              </div>
+            </div>
+            <TextInput label="住所" value={address} onChange={setAddress} />
+            <TextInput label="電話番号（お店の連絡先）" value={phone} onChange={setPhone} type="tel" />
+            <TextInput
+              label="InstagramのURL"
+              value={instagramUrl}
+              onChange={setInstagramUrl}
+              placeholder="https://www.instagram.com/…"
+            />
+          </div>
+
+          {/* テーマ */}
+          <div className="mt-8">
+            <span className="mb-3 block text-sm font-semibold tracking-wide" style={{ color: "var(--dim)" }}>
+              カレンダーのテーマ
+            </span>
+            <div className="grid grid-cols-3 gap-2">
+              {THEME_OPTIONS.map((t) => {
+                const active = theme === t.key;
+                return (
+                  <button
+                    key={t.key}
+                    type="button"
+                    onClick={() => setTheme(t.key as ThemeKey)}
+                    className="rounded-3xl border p-3 text-left"
+                    style={{
+                      background: t.bg,
+                      borderColor: active ? t.accent : "var(--border)",
+                      boxShadow: active ? `inset 0 0 0 2px ${t.accent}` : undefined,
+                    }}
+                  >
+                    <span className="block h-6 w-6 rounded-full" style={{ background: t.accent }} />
+                    <span className="mt-2 block text-sm font-semibold" style={{ color: "#33302a" }}>
+                      {t.label}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+              選ぶとこの画面の配色も切り替わります。保存すると公開カレンダーに反映されます。
+            </p>
+          </div>
+
+          <div className="mt-6 space-y-3">
+            <ErrorBox message={profileErr} />
+            {profileMsg ? (
+              <p className="rounded-2xl px-4 py-3 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }}>
+                {profileMsg}
+              </p>
+            ) : null}
+            <PrimaryButton onClick={saveProfile} disabled={profileMutation.isPending}>
+              設定を保存する
+            </PrimaryButton>
+          </div>
+        </Card>
+
+        {/* リンク */}
+        <Card className="mt-6">
+          <h2 className="text-lg font-bold">リンク</h2>
+          <div className="mt-5 space-y-6">
+            <div>
+              <span className="mb-2 block text-sm font-semibold tracking-wide" style={{ color: "var(--dim)" }}>
+                公開URL（お客さんに伝えるリンク）
+              </span>
+              <div className="flex gap-2">
+                <input
+                  readOnly
+                  value={publicUrl}
+                  className="min-h-14 min-w-0 flex-1 rounded-2xl border px-4 text-sm"
+                  style={{ background: "var(--surface-alt)", borderColor: "var(--border)", color: "var(--text)" }}
+                  onFocus={(e) => e.target.select()}
+                />
+                <button
+                  type="button"
+                  onClick={() => void copyText("public", publicUrl)}
+                  className="min-h-14 shrink-0 rounded-2xl px-5 font-semibold"
+                  style={{ background: "var(--accent)", color: "var(--accent-text)" }}
+                >
+                  {copied === "public" ? "コピー済み" : "コピー"}
+                </button>
+              </div>
+              <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+                Instagramのプロフィールや公式LINE、ホームページにこのリンクを貼ってください。
+              </p>
+            </div>
+            <div>
+              <span className="mb-2 block text-sm font-semibold tracking-wide" style={{ color: "var(--dim)" }}>
+                編集リンク（秘密）
+              </span>
+              {editUrl ? (
+                <div className="flex gap-2">
+                  <input
+                    readOnly
+                    value={editUrl}
+                    className="min-h-14 min-w-0 flex-1 rounded-2xl border px-4 text-sm"
+                    style={{ background: "var(--surface-alt)", borderColor: "var(--border)", color: "var(--text)" }}
+                    onFocus={(e) => e.target.select()}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void copyText("edit", editUrl)}
+                    className="min-h-14 shrink-0 rounded-2xl px-5 font-semibold"
+                    style={{ background: "var(--accent)", color: "var(--accent-text)" }}
+                  >
+                    {copied === "edit" ? "コピー済み" : "コピー"}
+                  </button>
+                </div>
+              ) : (
+                <p className="text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+                  編集リンクは、発行したときにだけ表示されます（安全のため、サーバーには文字列そのものを保存していません）。下のボタンで再発行すると、新しいリンクが表示されます。
+                </p>
+              )}
+              <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--closed)" }}>
+                このリンクを知っている人は誰でもカレンダーを編集できます。人に教えたり、公開したりしないでください。
+              </p>
+              {confirmReissue ? (
+                <div className="mt-3 space-y-3">
+                  <p className="text-sm leading-relaxed">
+                    再発行すると、今までの編集リンクは使えなくなります。よろしいですか？
+                  </p>
+                  <div className="flex gap-3">
+                    <div className="flex-1">
+                      <PrimaryButton onClick={() => reissueMutation.mutate()} disabled={reissueMutation.isPending}>
+                        再発行する
+                      </PrimaryButton>
+                    </div>
+                    <div className="flex-1">
+                      <GhostButton onClick={() => setConfirmReissue(false)}>やめる</GhostButton>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-3">
+                  <GhostButton onClick={() => setConfirmReissue(true)}>編集リンクを再発行する</GhostButton>
+                </div>
+              )}
+            </div>
+          </div>
+        </Card>
+
+        {/* パスワード */}
+        {scope === "owner" ? (
+          <Card className="mt-6">
+            <h2 className="text-lg font-bold">パスワードの変更</h2>
+            <div className="mt-5 space-y-5">
+              <TextInput
+                label="今のパスワード"
+                type="password"
+                value={currentPw}
+                onChange={setCurrentPw}
+                autoComplete="current-password"
+              />
+              <TextInput
+                label="新しいパスワード"
+                type="password"
+                value={newPw}
+                onChange={setNewPw}
+                autoComplete="new-password"
+                hint="8文字以上で設定してください"
+              />
+              <ErrorBox message={pwErr} />
+              {pwMsg ? (
+                <p className="rounded-2xl px-4 py-3 text-sm" style={{ background: "var(--accent-soft)", color: "var(--text)" }}>
+                  {pwMsg}
+                </p>
+              ) : null}
+              <PrimaryButton
+                onClick={() => {
+                  setPwMsg(null);
+                  setPwErr(null);
+                  pwMutation.mutate({ slug: props.slug, currentPassword: currentPw, newPassword: newPw });
+                }}
+                disabled={pwMutation.isPending}
+              >
+                パスワードを変更する
+              </PrimaryButton>
+            </div>
+          </Card>
+        ) : shop.hasPassword ? (
+          <p className="mt-6 px-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+            パスワードの変更は、IDとパスワードでログインしているときだけ行えます。
+          </p>
+        ) : null}
+
+        <div className="mt-8">
+          <GhostButton onClick={() => void logout()}>ログアウト</GhostButton>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+// ---------- admin (/admin) ----------
+
+function AdminPage() {
+  const queryClient = useQueryClient();
+  const statusQ = useQuery({ queryKey: ["adminStatus"], queryFn: () => api.getAdminStatus({}) });
+  const [password, setPassword] = useState("");
+  const [unlocked, setUnlocked] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  const [newAdminPw, setNewAdminPw] = useState("");
+  const [adminPwMsg, setAdminPwMsg] = useState<string | null>(null);
+
+  const accountsQ = useQuery({
+    queryKey: ["adminAccounts"],
+    queryFn: () => api.adminListAccounts({ adminPassword: password }),
+    enabled: unlocked,
+  });
+
+  async function setup(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await api.setupAdminPassword({ newPassword: password });
+      if (!res.ok) {
+        setError(res.error ?? "設定に失敗しました");
+        return;
+      }
+      setUnlocked(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "設定に失敗しました");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function login(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await api.verifyAdminPassword({ password });
+      if (!res.ok) {
+        setError("パスワードが違います");
+        return;
+      }
+      setUnlocked(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "認証に失敗しました");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteAccount(shopId: number) {
+    setError(null);
+    try {
+      const res = await api.adminDeleteAccount({ adminPassword: password, shopId });
+      if (!res.ok) {
+        setError(res.error ?? "削除に失敗しました");
+        return;
+      }
+      setConfirmDeleteId(null);
+      void queryClient.invalidateQueries({ queryKey: ["adminAccounts"] });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "削除に失敗しました");
+    }
+  }
+
+  async function changeAdminPw() {
+    setAdminPwMsg(null);
+    setError(null);
+    try {
+      const res = await api.changeAdminPassword({ currentPassword: password, newPassword: newAdminPw });
+      if (!res.ok) {
+        setError(res.error ?? "変更に失敗しました");
+        return;
+      }
+      setPassword(newAdminPw);
+      setNewAdminPw("");
+      setAdminPwMsg("管理者パスワードを変更しました");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "変更に失敗しました");
+    }
+  }
+
+  return (
+    <div style={{ background: "var(--bg)", color: "var(--text)" }}>
+      <SafeAreaTopScrim backgroundColor="var(--bg)" />
+      <main className="mx-auto min-h-dvh w-full max-w-xl px-5 pt-14 pb-16">
+        <h1 className="font-display text-3xl font-bold">全体管理</h1>
+        <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+          運営用ページです。アカウントの一覧と削除だけを行います（登録は各お店のセルフ登録）。
+        </p>
+
+        {statusQ.isLoading ? (
+          <p className="mt-10" style={{ color: "var(--dim)" }}>
+            読み込み中…
+          </p>
+        ) : !unlocked ? (
+          <Card className="mt-8">
+            <form onSubmit={statusQ.data?.needsSetup ? setup : login} className="space-y-5">
+              <TextInput
+                label={statusQ.data?.needsSetup ? "管理者パスワードを設定" : "管理者パスワード"}
+                type="password"
+                value={password}
+                onChange={setPassword}
+                autoComplete={statusQ.data?.needsSetup ? "new-password" : "current-password"}
+                hint={
+                  statusQ.data?.needsSetup
+                    ? "まだ設定されていません。最初に開いた管理者本人がここで設定します"
+                    : undefined
+                }
+              />
+              <ErrorBox message={error} />
+              <PrimaryButton type="submit" disabled={busy}>
+                {statusQ.data?.needsSetup ? "設定して開く" : "開く"}
+              </PrimaryButton>
+            </form>
+          </Card>
+        ) : (
+          <div className="mt-8 space-y-6">
+            <ErrorBox message={error} />
+            <Card>
+              <h2 className="text-lg font-bold">アカウント一覧</h2>
+              {accountsQ.isLoading ? (
+                <p className="mt-4" style={{ color: "var(--dim)" }}>
+                  読み込み中…
+                </p>
+              ) : (accountsQ.data?.accounts.length ?? 0) === 0 ? (
+                <p className="mt-4" style={{ color: "var(--dim)" }}>
+                  アカウントはまだありません
+                </p>
+              ) : (
+                <ul className="mt-4 space-y-4">
+                  {accountsQ.data?.accounts.map((a) => (
+                    <li
+                      key={a.id}
+                      className="rounded-2xl border p-4"
+                      style={{ borderColor: "var(--border)" }}
+                    >
                       <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <p className="text-2xl font-bold">
-                            {b.startTime}〜{toHHMM(toMin(b.startTime) + b.minutes)}
+                        <div className="min-w-0">
+                          <p className="truncate font-bold">{a.name}</p>
+                          <p className="tnum mt-1 text-sm" style={{ color: "var(--dim)" }}>
+                            /{a.slug} ／ パスワード{a.hasPassword ? "設定済み" : "未設定"} ／ 編集リンク
+                            {a.editTokenSet ? "発行済み" : "未発行"}
                           </p>
-                          <p className="text-lg font-bold">{b.customerName} 様</p>
-                          <p className="text-lg">{b.menuName}（{b.minutes}分）</p>
-                          <p className="text-base text-[var(--dim)]">
-                            電話：<a href={`tel:${digits(b.phone)}`} className="underline">{b.phone}</a>
+                          <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+                            最終更新：{a.updatedAt ? relativeUpdated(a.updatedAt, todayJST()) ?? "—" : "—"}
                           </p>
                         </div>
-                        {confirmId === b.id ? (
-                          <div className="flex flex-col gap-2">
+                        {confirmDeleteId === a.id ? (
+                          <div className="flex shrink-0 flex-col gap-2">
                             <button
                               type="button"
-                              className="min-h-12 rounded-[var(--radius)] bg-[var(--red)] px-4 text-lg font-bold text-white"
-                              onClick={() => cancelMut.mutate(b.id)}
+                              onClick={() => void deleteAccount(a.id)}
+                              className="min-h-11 rounded-xl px-4 text-sm font-semibold"
+                              style={{ background: "var(--closed)", color: "#fff" }}
                             >
-                              本当に取消
+                              本当に削除
                             </button>
                             <button
                               type="button"
-                              className="min-h-12 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold"
-                              onClick={() => setConfirmId(null)}
+                              onClick={() => setConfirmDeleteId(null)}
+                              className="min-h-11 rounded-xl px-4 text-sm font-semibold"
+                              style={{ background: "var(--surface-alt)", color: "var(--text)" }}
                             >
                               やめる
                             </button>
@@ -782,1673 +1717,60 @@ function OwnerBookings({ state, shop, ownerPin }: { state: State; shop: Shop; ow
                         ) : (
                           <button
                             type="button"
-                            className="min-h-12 shrink-0 rounded-[var(--radius)] border-2 border-[var(--red)] px-4 text-lg font-bold text-[var(--red)]"
-                            onClick={() => setConfirmId(b.id)}
+                            onClick={() => setConfirmDeleteId(a.id)}
+                            className="min-h-11 shrink-0 rounded-xl px-4 text-sm font-semibold"
+                            style={{ background: "var(--closed-bg)", color: "var(--closed)" }}
                           >
-                            取消
+                            削除
                           </button>
                         )}
                       </div>
-                    </div>
+                    </li>
                   ))}
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-        <h3 className="text-xl font-bold">電話で受けた予約を追加</h3>
-        <div className="mt-3 space-y-4">
-          <div>
-            <label htmlFor="ma-date" className={labelCls}>日付</label>
-            <input id="ma-date" type="date" className={inputCls} value={mDate} min={state.today}
-              onChange={(e) => setMDate(e.target.value)} />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label htmlFor="ma-time" className={labelCls}>開始時間</label>
-              <select id="ma-time" className={inputCls} value={mTime} onChange={(e) => setMTime(e.target.value)}>
-                {slotOptions.map((t) => (
-                  <option key={t} value={t}>{t}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label htmlFor="ma-menu" className={labelCls}>メニュー</label>
-              <select id="ma-menu" className={inputCls} value={mMenuId} onChange={(e) => setMMenuId(Number(e.target.value))}>
-                {menus.map((m) => (
-                  <option key={m.id} value={m.id}>{m.name}（{m.minutes}分）</option>
-                ))}
-              </select>
-            </div>
-          </div>
-          <div>
-            <label htmlFor="ma-name" className={labelCls}>お名前</label>
-            <input id="ma-name" className={inputCls} value={mName} onChange={(e) => setMName(e.target.value)} placeholder="例：佐藤 一郎" />
-          </div>
-          <div>
-            <label htmlFor="ma-phone" className={labelCls}>電話番号</label>
-            <input id="ma-phone" className={inputCls} value={mPhone} onChange={(e) => setMPhone(e.target.value)} placeholder="例：09012345678" inputMode="tel" />
-          </div>
-          {mError && <p className="text-lg font-bold text-[var(--red)]">{mError}</p>}
-          {mMsg && <p className="text-lg font-bold text-[var(--green)]">{mMsg}</p>}
-          <button
-            type="button"
-            className={bigBtnCls}
-            disabled={mName.trim().length === 0 || digits(mPhone).length < 10 || mMenuId === 0 || addMut.isPending}
-            onClick={() => addMut.mutate()}
-          >
-            予約を追加する
-          </button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-// ---------- owner: calendar edit ----------
-
-function CalendarEdit({ state, shop, ownerPin }: { state: State; shop: Shop; ownerPin: string }) {
-  const queryClient = useQueryClient();
-  const [selected, setSelected] = useState<string>(state.today);
-  const [closedWeekdays, setClosedWeekdays] = useState<number[]>(shop.closedWeekdays);
-  const [nthClosures, setNthClosures] = useState<{ nth: number; weekday: number }[]>(shop.nthClosures);
-  const [addNth, setAddNth] = useState(1);
-  const [addWeekday, setAddWeekday] = useState(1);
-  const [ruleMsg, setRuleMsg] = useState<string | null>(null);
-
-  useEffect(() => {
-    setClosedWeekdays(shop.closedWeekdays);
-    setNthClosures(shop.nthClosures);
-  }, [shop.id, shop.closedWeekdays, shop.nthClosures]);
-
-  const invalidate = () => void queryClient.invalidateQueries({ queryKey: ["state"] });
-
-  const saveRulesMut = useMutation({
-    mutationFn: () =>
-      api.updateShop({
-        id: shop.id,
-        ownerPin,
-        slug: shop.slug,
-        name: shop.name,
-        address: shop.address,
-        phone: shop.phone,
-        openTime: shop.openTime,
-        closeTime: shop.closeTime,
-        slotMinutes: shop.slotMinutes,
-        chairs: shop.chairs,
-        closedWeekdays,
-        nthClosures,
-      }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        setRuleMsg("定休日を保存しました");
-        invalidate();
-      } else {
-        setRuleMsg(res.error ?? "保存に失敗しました");
-      }
-    },
-    onError: () => setRuleMsg("保存に失敗しました"),
-  });
-
-  const [overrideError, setOverrideError] = useState<string | null>(null);
-  const overrideMut = useMutation({
-    mutationFn: (kind: "closed" | "open" | "clear") =>
-      api.setDayOverride({ shopId: shop.id, ownerPin, date: selected, kind }),
-    onSuccess: () => {
-      setOverrideError(null);
-      invalidate();
-    },
-    onError: () => setOverrideError("保存に失敗しました。もう一度お試しください"),
-  });
-
-  const selStatus = dayStatus(shop, state.overrides, selected);
-  const selOverride = state.overrides.find((o) => o.shopId === shop.id && o.date === selected);
-
-  return (
-    <div className="space-y-8">
-      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-        <h3 className="text-xl font-bold">定休日のルール</h3>
-        <p className="mt-1 text-base text-[var(--dim)]">毎週休む曜日</p>
-        <div className="mt-2 flex flex-wrap gap-2">
-          {WEEKDAYS.map((w, i) => {
-            const on = closedWeekdays.includes(i);
-            return (
-              <button
-                key={w}
-                type="button"
-                aria-pressed={on}
-                onClick={() =>
-                  setClosedWeekdays(on ? closedWeekdays.filter((x) => x !== i) : [...closedWeekdays, i])
-                }
-                className={`min-h-14 min-w-14 rounded-full text-xl font-bold ${
-                  on ? "bg-[var(--red)] text-white" : "bg-[var(--surface-alt)] text-[var(--text)]"
-                }`}
-              >
-                {w}
-              </button>
-            );
-          })}
-        </div>
-        <p className="mt-4 text-base text-[var(--dim)]">「第○週の○曜日」だけ休む（例：第2・第3火曜）</p>
-        <div className="mt-2 space-y-2">
-          {nthClosures.map((c, i) => (
-            <div key={`${c.nth}-${c.weekday}-${i}`} className="flex items-center justify-between rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 py-2">
-              <span className="text-lg font-bold">第{c.nth} {WEEKDAYS[c.weekday] ?? ""}曜日</span>
-              <button
-                type="button"
-                aria-label={`第${c.nth}${WEEKDAYS[c.weekday] ?? ""}曜の定休を削除`}
-                className="min-h-11 rounded-[var(--radius)] border-2 border-[var(--red)] px-3 text-base font-bold text-[var(--red)]"
-                onClick={() => setNthClosures(nthClosures.filter((_, j) => j !== i))}
-              >
-                削除
-              </button>
-            </div>
-          ))}
-          {nthClosures.length === 0 && <p className="text-base text-[var(--dim)]">設定なし</p>}
-        </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <select aria-label="第何週" className="min-h-12 rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] px-3 text-lg"
-            value={addNth} onChange={(e) => setAddNth(Number(e.target.value))}>
-            {[1, 2, 3, 4, 5].map((n) => (
-              <option key={n} value={n}>第{n}週</option>
-            ))}
-          </select>
-          <select aria-label="追加する曜日" className="min-h-12 rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] px-3 text-lg"
-            value={addWeekday} onChange={(e) => setAddWeekday(Number(e.target.value))}>
-            {WEEKDAYS.map((w, i) => (
-              <option key={w} value={i}>{w}曜日</option>
-            ))}
-          </select>
-          <button
-            type="button"
-            className="min-h-12 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold"
-            onClick={() => {
-              if (!nthClosures.some((c) => c.nth === addNth && c.weekday === addWeekday)) {
-                setNthClosures([...nthClosures, { nth: addNth, weekday: addWeekday }]);
-              }
-            }}
-          >
-            追加
-          </button>
-        </div>
-        {ruleMsg && <p className="mt-3 text-lg font-bold text-[var(--green)]">{ruleMsg}</p>}
-        <button type="button" className={`${bigBtnCls} mt-4`} disabled={saveRulesMut.isPending}
-          onClick={() => saveRulesMut.mutate()}>
-          定休日を保存する
-        </button>
-      </section>
-
-      <section>
-        <h3 className="text-xl font-bold">日ごとの臨時休業・臨時営業</h3>
-        <p className="mt-1 text-base text-[var(--dim)]">カレンダーの日付をタップして選んでください。</p>
-        <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-3 shadow-sm">
-          <MonthCalendar
-            shop={shop}
-            overrides={state.overrides}
-            bookings={state.bookings}
-            today={state.today}
-            selected={selected}
-            onSelect={setSelected}
-            showLoad
-          />
-        </div>
-        <div className="mt-4 rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-          <p className="text-xl font-bold">
-            {fmtDateJP(selected)}：現在は「{selStatus.label}」
-          </p>
-          {overrideError && (
-            <p className="mt-2 text-lg font-bold text-[var(--red)]">{overrideError}</p>
-          )}
-          <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-            <button
-              type="button"
-              className="min-h-14 rounded-[var(--radius)] bg-[var(--red)] px-3 text-lg font-bold text-white disabled:opacity-40"
-              disabled={selOverride?.kind === "closed"}
-              onClick={() => overrideMut.mutate("closed")}
-            >
-              臨時休業にする
-            </button>
-            <button
-              type="button"
-              className="min-h-14 rounded-[var(--radius)] bg-[var(--green)] px-3 text-lg font-bold text-white disabled:opacity-40"
-              disabled={selOverride?.kind === "open"}
-              onClick={() => overrideMut.mutate("open")}
-            >
-              臨時営業にする
-            </button>
-            <button
-              type="button"
-              className="min-h-14 rounded-[var(--radius)] bg-[var(--surface-alt)] px-3 text-lg font-bold disabled:opacity-40"
-              disabled={!selOverride}
-              onClick={() => overrideMut.mutate("clear")}
-            >
-              通常に戻す
-            </button>
-          </div>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-// ---------- owner: settings ----------
-
-function Settings({
-  state,
-  shop,
-  ownerPin,
-  onPinChanged,
-  onSlugChanged,
-}: {
-  state: State;
-  shop: Shop;
-  ownerPin: string;
-  onPinChanged: (shopId: number, newPin: string) => void;
-  onSlugChanged: (newSlug: string) => void;
-}) {
-  const queryClient = useQueryClient();
-  const [slug, setSlug] = useState(shop.slug);
-  const [name, setName] = useState(shop.name);
-  const [address, setAddress] = useState(shop.address);
-  const [phone, setPhone] = useState(shop.phone);
-  const [openTime, setOpenTime] = useState(shop.openTime);
-  const [closeTime, setCloseTime] = useState(shop.closeTime);
-  const [slotMinutes, setSlotMinutes] = useState(shop.slotMinutes);
-  const [chairs, setChairs] = useState(shop.chairs);
-  const [shopMsg, setShopMsg] = useState<string | null>(null);
-  const [shopError, setShopError] = useState<string | null>(null);
-
-  const [curPin, setCurPin] = useState("");
-  const [newPin, setNewPin] = useState("");
-  const [newPin2, setNewPin2] = useState("");
-  const [pinMsg, setPinMsg] = useState<string | null>(null);
-  const [pinError, setPinError] = useState<string | null>(null);
-
-  const changePinMut = useMutation({
-    mutationFn: () =>
-      api.changeOwnerPin({ shopId: shop.id, currentPin: curPin, newPin }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        onPinChanged(shop.id, newPin);
-        setPinMsg("暗証番号を変更しました。次回から新しい暗証番号で入ってください。");
-        setPinError(null);
-        setCurPin("");
-        setNewPin("");
-        setNewPin2("");
-        invalidate();
-      } else {
-        setPinError(res.error ?? "変更できませんでした");
-        setPinMsg(null);
-      }
-    },
-    onError: () => {
-      setPinError("通信に失敗しました。もう一度お試しください");
-      setPinMsg(null);
-    },
-  });
-
-  const pinValid =
-    /^\d{4}$/.test(curPin) &&
-    /^\d{4}$/.test(newPin) &&
-    newPin === newPin2 &&
-    !changePinMut.isPending;
-
-  const [editMenuId, setEditMenuId] = useState<number | null>(null);
-  const [menuName, setMenuName] = useState("");
-  const [menuPrice, setMenuPrice] = useState("");
-  const [menuMinutes, setMenuMinutes] = useState("60");
-  const [menuMsg, setMenuMsg] = useState<string | null>(null);
-  const [confirmDeleteMenu, setConfirmDeleteMenu] = useState<number | null>(null);
-
-  useEffect(() => {
-    setSlug(shop.slug);
-    setName(shop.name);
-    setAddress(shop.address);
-    setPhone(shop.phone);
-    setOpenTime(shop.openTime);
-    setCloseTime(shop.closeTime);
-    setSlotMinutes(shop.slotMinutes);
-    setChairs(shop.chairs);
-    setEditMenuId(null);
-    setMenuName("");
-    setMenuPrice("");
-    setMenuMinutes("60");
-  }, [shop]);
-
-  const invalidate = () => void queryClient.invalidateQueries({ queryKey: ["state"] });
-  const menus = state.menus.filter((m) => m.shopId === shop.id);
-
-  const slugValid =
-    /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug.trim()) &&
-    slug.trim().length >= 2 &&
-    slug.trim().length <= 32 &&
-    slug.trim() !== "owner" &&
-    slug.trim() !== "admin";
-  const slugTakenByOther = state.shops.some(
-    (s) => s.id !== shop.id && s.slug === slug.trim(),
-  );
-
-  const saveShopMut = useMutation({
-    mutationFn: () =>
-      api.updateShop({
-        id: shop.id,
-        ownerPin,
-        slug: slug.trim(),
-        name: name.trim(),
-        address: address.trim(),
-        phone: phone.trim(),
-        openTime,
-        closeTime,
-        slotMinutes,
-        chairs,
-        closedWeekdays: shop.closedWeekdays,
-        nthClosures: shop.nthClosures,
-      }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        setShopMsg("お店の設定を保存しました");
-        setShopError(null);
-        invalidate();
-        if (slug.trim() !== shop.slug) onSlugChanged(slug.trim());
-      } else {
-        setShopError(res.error ?? "保存に失敗しました");
-        setShopMsg(null);
-      }
-    },
-    onError: () => {
-      setShopError("保存に失敗しました");
-      setShopMsg(null);
-    },
-  });
-
-  const saveMenuMut = useMutation({
-    mutationFn: () =>
-      api.upsertMenu({
-        id: editMenuId,
-        shopId: shop.id,
-        ownerPin,
-        name: menuName.trim(),
-        price: menuPrice.trim() === "" ? null : Number(menuPrice),
-        minutes: Number(menuMinutes),
-      }),
-    onSuccess: () => {
-      setMenuMsg(editMenuId === null ? "メニューを追加しました" : "メニューを保存しました");
-      setEditMenuId(null);
-      setMenuName("");
-      setMenuPrice("");
-      setMenuMinutes("60");
-      invalidate();
-    },
-    onError: () => setMenuMsg("保存に失敗しました"),
-  });
-
-  const deleteMenuMut = useMutation({
-    mutationFn: (id: number) => api.deleteMenu({ id, shopId: shop.id, ownerPin }),
-    onSuccess: () => {
-      setConfirmDeleteMenu(null);
-      invalidate();
-    },
-  });
-
-  const menuValid =
-    menuName.trim().length > 0 &&
-    Number(menuMinutes) >= 10 &&
-    (menuPrice.trim() === "" || (!Number.isNaN(Number(menuPrice)) && Number(menuPrice) >= 0));
-
-  return (
-    <div className="space-y-8">
-      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-        <h3 className="text-xl font-bold">お店の情報</h3>
-        <div className="mt-3 space-y-4">
-          <div>
-            <label htmlFor="st-name" className={labelCls}>店名</label>
-            <input id="st-name" className={inputCls} value={name} onChange={(e) => setName(e.target.value)} />
-          </div>
-          <div>
-            <label htmlFor="st-slug" className={labelCls}>URL用スラッグ（このお店専用URL）</label>
-            <input
-              id="st-slug"
-              className={inputCls}
-              value={slug}
-              onChange={(e) => setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))}
-              placeholder="例：shop1"
-              autoComplete="off"
-              autoCapitalize="none"
-              spellCheck={false}
-            />
-            <p className="mt-1 text-base text-[var(--dim)]">
-              英小文字・数字・ハイフンで2〜32文字。他のお店と重複できません。
-              変えると古いURL（店内QRコードなど）は使えなくなります。
-            </p>
-            <p className="mt-1 text-base">
-              お客さん用：<span className="font-bold">/{slug.trim() || "…"}</span>
-              <br />
-              店主用：<span className="font-bold">/{slug.trim() || "…"}/owner</span>
-            </p>
-            {slug.trim().length > 0 && !slugValid && (
-              <p className="mt-1 text-lg font-bold text-[var(--red)]">
-                スラッグの形式が正しくありません（「owner」「admin」は使えません）。
-              </p>
-            )}
-            {slugValid && slugTakenByOther && (
-              <p className="mt-1 text-lg font-bold text-[var(--red)]">
-                このスラッグは他のお店で使われています。
-              </p>
-            )}
-          </div>
-          <div>
-            <label htmlFor="st-address" className={labelCls}>住所</label>
-            <input id="st-address" className={inputCls} value={address} onChange={(e) => setAddress(e.target.value)} placeholder="例：東京都○○区…" />
-          </div>
-          <div>
-            <label htmlFor="st-phone" className={labelCls}>電話番号</label>
-            <input id="st-phone" className={inputCls} value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="例：03-1234-5678" inputMode="tel" />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label htmlFor="st-open" className={labelCls}>開店時間</label>
-              <input id="st-open" type="time" className={inputCls} value={openTime} onChange={(e) => setOpenTime(e.target.value)} />
-            </div>
-            <div>
-              <label htmlFor="st-close" className={labelCls}>閉店時間</label>
-              <input id="st-close" type="time" className={inputCls} value={closeTime} onChange={(e) => setCloseTime(e.target.value)} />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label htmlFor="st-slot" className={labelCls}>予約枠の単位</label>
-              <select id="st-slot" className={inputCls} value={slotMinutes} onChange={(e) => setSlotMinutes(Number(e.target.value))}>
-                {[15, 20, 30, 60].map((n) => (
-                  <option key={n} value={n}>{n}分</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label htmlFor="st-chairs" className={labelCls}>椅子の数（同時受付）</label>
-              <select id="st-chairs" className={inputCls} value={chairs} onChange={(e) => setChairs(Number(e.target.value))}>
-                {[1, 2, 3, 4, 5].map((n) => (
-                  <option key={n} value={n}>{n}台</option>
-                ))}
-              </select>
-            </div>
-          </div>
-          {shopError && <p className="text-lg font-bold text-[var(--red)]">{shopError}</p>}
-          {shopMsg && <p className="text-lg font-bold text-[var(--green)]">{shopMsg}</p>}
-          <button type="button" className={bigBtnCls} disabled={name.trim().length === 0 || !slugValid || slugTakenByOther || saveShopMut.isPending}
-            onClick={() => saveShopMut.mutate()}>
-            お店の設定を保存する
-          </button>
-        </div>
-      </section>
-
-      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-        <h3 className="text-xl font-bold">店主画面の暗証番号</h3>
-        {shop.pinNeedsSetup ? (
-          <p className="mt-2 rounded-[var(--radius)] border-2 border-[var(--red)] bg-[var(--surface-alt)] p-3 text-lg font-bold text-[var(--red)]">
-            暗証番号が未設定です。店主画面の初回設定で設定してください。
-          </p>
-        ) : (
-          <p className="mt-1 text-base text-[var(--dim)]">
-            店主画面に入るときの4桁の暗証番号を変更できます。
-          </p>
-        )}
-        <div className="mt-3 space-y-4">
-          <div>
-            <label htmlFor="pin-cur" className={labelCls}>今の暗証番号（4桁）</label>
-            <input
-              id="pin-cur"
-              className={inputCls}
-              value={curPin}
-              onChange={(e) => setCurPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
-              placeholder="数字4桁"
-              inputMode="numeric"
-              type="password"
-              autoComplete="off"
-            />
-          </div>
-          <div>
-            <label htmlFor="pin-new" className={labelCls}>新しい暗証番号（4桁）</label>
-            <input
-              id="pin-new"
-              className={inputCls}
-              value={newPin}
-              onChange={(e) => setNewPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
-              placeholder="数字4桁"
-              inputMode="numeric"
-              type="password"
-              autoComplete="off"
-            />
-          </div>
-          <div>
-            <label htmlFor="pin-new2" className={labelCls}>新しい暗証番号（もう一度）</label>
-            <input
-              id="pin-new2"
-              className={inputCls}
-              value={newPin2}
-              onChange={(e) => setNewPin2(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
-              placeholder="数字4桁"
-              inputMode="numeric"
-              type="password"
-              autoComplete="off"
-            />
-          </div>
-          {newPin2.length === 4 && newPin !== newPin2 && (
-            <p className="text-lg font-bold text-[var(--red)]">
-              新しい暗証番号が2回で一致していません。
-            </p>
-          )}
-          {pinError && <p className="text-lg font-bold text-[var(--red)]">{pinError}</p>}
-          {pinMsg && <p className="text-lg font-bold text-[var(--green)]">{pinMsg}</p>}
-          <button
-            type="button"
-            className={bigBtnCls}
-            disabled={!pinValid}
-            onClick={() => changePinMut.mutate()}
-          >
-            暗証番号を変更する
-          </button>
-        </div>
-      </section>
-
-      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-        <h3 className="text-xl font-bold">メニュー・料金</h3>
-        <p className="mt-1 text-base text-[var(--dim)]">
-          料金・所要時間は仮の初期値です。実際のお店の価格に直してください。
-        </p>
-        <div className="mt-3 space-y-2">
-          {menus.map((m) => (
-            <div key={m.id} className="rounded-[var(--radius)] border-2 border-[var(--border)] px-4 py-3">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <p className="text-lg font-bold">{m.name}</p>
-                  <p className="text-base text-[var(--dim)]">
-                    {m.price !== null ? `¥${m.price.toLocaleString()}` : "料金未設定"}／約{m.minutes}分
-                  </p>
-                </div>
-                <div className="flex shrink-0 gap-2">
-                  <button
-                    type="button"
-                    className="min-h-11 rounded-[var(--radius)] bg-[var(--surface-alt)] px-3 text-base font-bold"
-                    onClick={() => {
-                      setEditMenuId(m.id);
-                      setMenuName(m.name);
-                      setMenuPrice(m.price !== null ? String(m.price) : "");
-                      setMenuMinutes(String(m.minutes));
-                      setMenuMsg(null);
-                    }}
-                  >
-                    編集
-                  </button>
-                  {confirmDeleteMenu === m.id ? (
-                    <button
-                      type="button"
-                      className="min-h-11 rounded-[var(--radius)] bg-[var(--red)] px-3 text-base font-bold text-white"
-                      onClick={() => deleteMenuMut.mutate(m.id)}
-                    >
-                      本当に削除
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className="min-h-11 rounded-[var(--radius)] border-2 border-[var(--red)] px-3 text-base font-bold text-[var(--red)]"
-                      onClick={() => setConfirmDeleteMenu(m.id)}
-                    >
-                      削除
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-          ))}
-          {menus.length === 0 && <p className="text-base text-[var(--dim)]">メニューはありません。下から追加できます。</p>}
-        </div>
-
-        <div className="mt-5 border-t-2 border-[var(--border)] pt-4">
-          <h4 className="text-lg font-bold">{editMenuId === null ? "メニューを追加" : "メニューを編集中"}</h4>
-          <div className="mt-3 space-y-4">
-            <div>
-              <label htmlFor="mn-name" className={labelCls}>メニュー名</label>
-              <input id="mn-name" className={inputCls} value={menuName} onChange={(e) => setMenuName(e.target.value)} placeholder="例：カット" />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label htmlFor="mn-price" className={labelCls}>料金（円・空欄可）</label>
-                <input id="mn-price" className={inputCls} value={menuPrice} onChange={(e) => setMenuPrice(e.target.value)} placeholder="例：4000" inputMode="numeric" />
-              </div>
-              <div>
-                <label htmlFor="mn-min" className={labelCls}>所要時間（分）</label>
-                <input id="mn-min" className={inputCls} value={menuMinutes} onChange={(e) => setMenuMinutes(e.target.value)} placeholder="例：60" inputMode="numeric" />
-              </div>
-            </div>
-            {menuMsg && <p className="text-lg font-bold text-[var(--green)]">{menuMsg}</p>}
-            <div className="flex gap-2">
-              <button type="button" className={`${bigBtnCls} flex-1`} disabled={!menuValid || saveMenuMut.isPending}
-                onClick={() => saveMenuMut.mutate()}>
-                {editMenuId === null ? "追加する" : "保存する"}
-              </button>
-              {editMenuId !== null && (
-                <button type="button" className="min-h-14 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold"
-                  onClick={() => {
-                    setEditMenuId(null);
-                    setMenuName("");
-                    setMenuPrice("");
-                    setMenuMinutes("60");
-                  }}>
-                  やめる
-                </button>
+                </ul>
               )}
-            </div>
-          </div>
-        </div>
-      </section>
-    </div>
-  );
-}
+            </Card>
 
-// ---------- owner: PIN gate ----------
-
-function PinGate({
-  shop,
-  onSuccess,
-  onBack,
-}: {
-  shop: Shop;
-  onSuccess: (pin: string) => void;
-  onBack: () => void;
-}) {
-  const [pin, setPin] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [checking, setChecking] = useState(false);
-
-  const attempt = async (value: string) => {
-    setChecking(true);
-    setError(null);
-    try {
-      const res = await api.verifyOwnerPin({ shopId: shop.id, pin: value });
-      if (res.ok) {
-        onSuccess(value);
-      } else {
-        setError("暗証番号が違います。もう一度入力してください。");
-        setPin("");
-      }
-    } catch {
-      setError("通信に失敗しました。もう一度お試しください。");
-    } finally {
-      setChecking(false);
-    }
-  };
-
-  const pushDigit = (d: string) => {
-    if (checking || pin.length >= 4) return;
-    const next = pin + d;
-    setPin(next);
-    setError(null);
-    if (next.length === 4) void attempt(next);
-  };
-
-  const handleInput = (value: string) => {
-    const cleaned = value.replace(/[^0-9]/g, "").slice(0, 4);
-    setPin(cleaned);
-    setError(null);
-    if (cleaned.length === 4 && !checking) void attempt(cleaned);
-  };
-
-  return (
-    <section className="mx-auto max-w-md rounded-[var(--radius)] bg-[var(--surface)] p-5 shadow-sm">
-      <h2 className="text-center text-2xl font-bold">店主画面ロック</h2>
-      <p className="mt-2 text-center text-lg">
-        <span className="font-bold">{shop.name}</span> の店主画面です。
-        <br />
-        暗証番号（数字4桁）を入力してください。
-      </p>
-      <div className="mt-5 flex items-center justify-center gap-3" aria-hidden="true">
-        {[0, 1, 2, 3].map((i) => (
-          <span
-            key={i}
-            className={`h-6 w-6 rounded-full border-2 ${
-              pin.length > i
-                ? "border-[var(--accent)] bg-[var(--accent)]"
-                : "border-[var(--border)] bg-[var(--surface)]"
-            }`}
-          />
-        ))}
-      </div>
-      <p className="mt-2 text-center text-base text-[var(--dim)]" role="status">
-        {checking ? "確認しています…" : `${pin.length} / 4 桁入力済み`}
-      </p>
-
-      {error && (
-        <p className="mt-3 rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-center text-lg font-bold text-[var(--red)]" role="alert">
-          {error}
-        </p>
-      )}
-
-      <div className="mt-5 grid grid-cols-3 gap-2">
-        {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((d) => (
-          <button
-            key={d}
-            type="button"
-            aria-label={`数字 ${d}`}
-            disabled={checking}
-            onClick={() => pushDigit(d)}
-            className="min-h-16 rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] text-3xl font-bold text-[var(--text)] disabled:opacity-40"
-          >
-            {d}
-          </button>
-        ))}
-        <button
-          type="button"
-          aria-label="全部消す"
-          disabled={checking || pin.length === 0}
-          onClick={() => setPin("")}
-          className="min-h-16 rounded-[var(--radius)] bg-[var(--surface-alt)] text-lg font-bold text-[var(--text)] disabled:opacity-40"
-        >
-          消す
-        </button>
-        <button
-          type="button"
-          aria-label="数字 0"
-          disabled={checking}
-          onClick={() => pushDigit("0")}
-          className="min-h-16 rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] text-3xl font-bold text-[var(--text)] disabled:opacity-40"
-        >
-          0
-        </button>
-        <button
-          type="button"
-          aria-label="1文字消す"
-          disabled={checking || pin.length === 0}
-          onClick={() => setPin(pin.slice(0, -1))}
-          className="min-h-16 rounded-[var(--radius)] bg-[var(--surface-alt)] text-lg font-bold text-[var(--text)] disabled:opacity-40"
-        >
-          ← 消す
-        </button>
-      </div>
-
-      <div className="mt-5">
-        <label htmlFor="pin-gate-input" className={labelCls}>
-          キーボードで入力する場合
-        </label>
-        <input
-          id="pin-gate-input"
-          className={`${inputCls} text-center text-2xl tracking-[0.5em]`}
-          value={pin}
-          onChange={(e) => handleInput(e.target.value)}
-          placeholder="4桁"
-          inputMode="numeric"
-          type="password"
-          autoComplete="off"
-          maxLength={4}
-        />
-      </div>
-
-      <button
-        type="button"
-        className="mt-6 min-h-14 w-full rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold text-[var(--text)]"
-        onClick={onBack}
-      >
-        お客さん画面に戻る
-      </button>
-    </section>
-  );
-}
-
-// ---------- owner: first-run PIN setup (no default PIN exists) ----------
-
-function SetupPin({
-  shop,
-  onSetup,
-  onBack,
-}: {
-  shop: Shop;
-  onSetup: (newPin: string) => void;
-  onBack: () => void;
-}) {
-  const queryClient = useQueryClient();
-  const [newPin, setNewPin] = useState("");
-  const [newPin2, setNewPin2] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  const setupMut = useMutation({
-    mutationFn: () => api.setupOwnerPin({ shopId: shop.id, newPin }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        onSetup(newPin);
-        void queryClient.invalidateQueries({ queryKey: ["state"] });
-      } else {
-        setError(res.error ?? "設定できませんでした");
-      }
-    },
-    onError: () => setError("通信に失敗しました。もう一度お試しください"),
-  });
-
-  const valid =
-    /^\d{4}$/.test(newPin) && newPin === newPin2 && !setupMut.isPending;
-
-  return (
-    <section className="mx-auto max-w-md rounded-[var(--radius)] bg-[var(--surface)] p-5 shadow-sm">
-      <h2 className="text-center text-2xl font-bold">暗証番号を決めてください</h2>
-      <p className="mt-2 text-lg">
-        <span className="font-bold">{shop.name}</span> の店主画面には、まだ暗証番号が設定されていません。
-        店主ご本人が、新しい暗証番号（数字4桁）を決めてください。
-        この番号は店主画面に入るたびに必要です。忘れない番号にしてください。
-      </p>
-      <div className="mt-4 space-y-4">
-        <div>
-          <label htmlFor="sup-new" className={labelCls}>新しい暗証番号（4桁）</label>
-          <input
-            id="sup-new"
-            className={inputCls}
-            value={newPin}
-            onChange={(e) => setNewPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
-            placeholder="数字4桁"
-            inputMode="numeric"
-            type="password"
-            autoComplete="off"
-          />
-        </div>
-        <div>
-          <label htmlFor="sup-new2" className={labelCls}>新しい暗証番号（もう一度）</label>
-          <input
-            id="sup-new2"
-            className={inputCls}
-            value={newPin2}
-            onChange={(e) => setNewPin2(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
-            placeholder="数字4桁"
-            inputMode="numeric"
-            type="password"
-            autoComplete="off"
-          />
-        </div>
-        {newPin2.length === 4 && newPin !== newPin2 && (
-          <p className="text-lg font-bold text-[var(--red)]">
-            暗証番号が2回で一致していません。
-          </p>
-        )}
-        {error && (
-          <p className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]" role="alert">
-            {error}
-          </p>
-        )}
-        <button
-          type="button"
-          className={bigBtnCls}
-          disabled={!valid}
-          onClick={() => setupMut.mutate()}
-        >
-          暗証番号を決めて店主画面へ
-        </button>
-        <button
-          type="button"
-          className="min-h-14 w-full rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold text-[var(--text)]"
-          onClick={onBack}
-        >
-          お客さん画面に戻る
-        </button>
-      </div>
-    </section>
-  );
-}
-
-// ---------- install guide (PWA) ----------
-
-interface BeforeInstallPromptEvent extends Event {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: string }>;
-}
-
-function InstallGuide({ shop }: { shop: Shop }) {
-  const [deferred, setDeferred] = useState<BeforeInstallPromptEvent | null>(null);
-  const [installed, setInstalled] = useState(false);
-
-  useEffect(() => {
-    const onPrompt = (e: Event) => {
-      e.preventDefault();
-      setDeferred(e as BeforeInstallPromptEvent);
-    };
-    const onInstalled = () => {
-      setInstalled(true);
-      setDeferred(null);
-    };
-    window.addEventListener("beforeinstallprompt", onPrompt);
-    window.addEventListener("appinstalled", onInstalled);
-    return () => {
-      window.removeEventListener("beforeinstallprompt", onPrompt);
-      window.removeEventListener("appinstalled", onInstalled);
-    };
-  }, []);
-
-  const standalone =
-    typeof window !== "undefined" &&
-    (window.matchMedia("(display-mode: standalone)").matches ||
-      (window.navigator as unknown as { standalone?: boolean }).standalone === true);
-
-  if (standalone || installed) {
-    return (
-      <section className="mt-5 rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-        <p className="text-lg font-bold text-[var(--green)]">
-          {shop.name}のページはホーム画面に追加済みです。このアイコンからいつでも開けます。
-        </p>
-      </section>
-    );
-  }
-
-  return (
-    <section className="mt-5 rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-      <h2 className="text-xl font-bold">ホーム画面に追加すると便利です</h2>
-      <p className="mt-1 text-base text-[var(--dim)]">
-        このページは{shop.name}専用の予約ページです。このまま追加すると、次回からアイコンをタップするだけで
-        {shop.name}の予約ができます（店内のQRコードもこのお店専用URLから作られています）。
-      </p>
-      {deferred && (
-        <button
-          type="button"
-          className={`${bigBtnCls} mt-3`}
-          onClick={() => {
-            void deferred.prompt();
-          }}
-        >
-          ホーム画面に追加する
-        </button>
-      )}
-      <div className="mt-3 grid gap-3 sm:grid-cols-2">
-        <div className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-3">
-          <p className="text-lg font-bold">iPhone（Safari）</p>
-          <ol className="mt-1 list-decimal space-y-1 pl-5 text-base">
-            <li>下の「共有」ボタン（四角に上矢印）をタップ</li>
-            <li>「ホーム画面に追加」を選ぶ</li>
-            <li>右上の「追加」をタップ</li>
-          </ol>
-        </div>
-        <div className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-3">
-          <p className="text-lg font-bold">Android（Chrome）</p>
-          <ol className="mt-1 list-decimal space-y-1 pl-5 text-base">
-            <li>右上のメニュー（︙）をタップ</li>
-            <li>「ホーム画面に追加」または「アプリをインストール」を選ぶ</li>
-            <li>「追加」をタップ</li>
-          </ol>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-// ---------- path routing ----------
-//
-// 店舗別URLは実パス形式で実現する（Bun サーバー / Workers Static Assets
-// ともに SPA フォールバックが効くため、どのパスでも index.html が返る）。
-//   /             … 店舗入口（各店へのリンク）
-//   /<slug>       … その店舗専用のお客さん用ページ
-//   /<slug>/owner … その店舗専用の店主用ページ
-//   /admin        … 全体管理ページ（どこからもリンクしない）
-// お客さん用ページには店主用ページへの導線を置かない。
-
-type Route =
-  | { kind: "entrance" }
-  | { kind: "customer"; slug: string }
-  | { kind: "owner"; slug: string }
-  | { kind: "admin" }
-  | { kind: "unknown"; slug: string };
-
-function parseRoute(): Route {
-  const parts = window.location.pathname.split("/").filter((s) => s.length > 0);
-  if (parts.length === 0) return { kind: "entrance" };
-  const slug = parts[0] ?? "";
-  // 「admin」はスラッグの予約語なので、店舗スラッグと衝突しない
-  if (parts.length === 1 && slug === "admin") return { kind: "admin" };
-  if (parts.length === 1) return { kind: "customer", slug };
-  if (parts.length === 2 && parts[1] === "owner") return { kind: "owner", slug };
-  return { kind: "unknown", slug };
-}
-
-function useRoute(): Route {
-  const [route, setRoute] = useState<Route>(() => parseRoute());
-  useEffect(() => {
-    const onChange = () => setRoute(parseRoute());
-    window.addEventListener("popstate", onChange);
-    return () => window.removeEventListener("popstate", onChange);
-  }, []);
-  return route;
-}
-
-function navigateTo(path: string) {
-  window.history.pushState(null, "", path);
-  window.dispatchEvent(new PopStateEvent("popstate"));
-}
-
-function ShopInfoCard({ shop, showSetupHint = false }: { shop: Shop; showSetupHint?: boolean }) {
-  return (
-    <div className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-      <h1 className="text-3xl font-bold">{shop.name}</h1>
-      <div className="mt-2 space-y-1 text-lg">
-        <p>
-          営業時間：{shop.openTime}〜{shop.closeTime}
-        </p>
-        <p>定休日：{closedSummary(shop)}</p>
-        {shop.address && <p>住所：{shop.address}</p>}
-        {shop.phone && (
-          <p>
-            電話：
-            <a href={`tel:${digits(shop.phone)}`} className="font-bold text-[var(--accent)] underline">
-              {shop.phone}
-            </a>
-          </p>
-        )}
-        {showSetupHint && !shop.address && !shop.phone && (
-          <p className="text-base text-[var(--dim)]">
-            住所・電話番号は店主画面の「設定」から登録できます。
-          </p>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ---------- admin (全体管理) ----------
-//
-// /admin 専用ページ。入口・お客さん用・店主用のどこにもリンクは置かない。
-// 管理者パスワードはサーバー側でハッシュ保存され、既知の初期パスワードは
-// 無い。未設定の間だけ、最初に開いた管理者本人が設定できる。
-
-const ADMIN_STORAGE_KEY = "barber-admin-password";
-
-function loadAdminPassword(): string | null {
-  try {
-    const v = window.sessionStorage.getItem(ADMIN_STORAGE_KEY);
-    return v && v.length > 0 ? v : null;
-  } catch {
-    return null;
-  }
-}
-
-function AdminSetup({ onSetup }: { onSetup: (pw: string) => void }) {
-  const [pw, setPw] = useState("");
-  const [pw2, setPw2] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const mut = useMutation({
-    mutationFn: () => api.setupAdminPassword({ newPassword: pw }),
-    onSuccess: (res) => {
-      if (res.ok) onSetup(pw);
-      else setError(res.error ?? "設定できませんでした");
-    },
-    onError: () => setError("通信に失敗しました。もう一度お試しください"),
-  });
-  const valid = pw.length >= 6 && pw === pw2 && !mut.isPending;
-  return (
-    <section className="mx-auto max-w-md rounded-[var(--radius)] bg-[var(--surface)] p-5 shadow-sm">
-      <h2 className="text-center text-2xl font-bold">管理者パスワードを設定</h2>
-      <p className="mt-2 text-base text-[var(--dim)]">
-        このページは全体管理用です。まだ管理者パスワードが設定されていません。管理者ご本人が新しいパスワード（6文字以上）を決めてください。パスワードはハッシュ化して保存され、平文では保存されません。
-      </p>
-      <div className="mt-4 space-y-4">
-        <div>
-          <label htmlFor="admin-setup-pw" className={labelCls}>新しい管理者パスワード（6文字以上）</label>
-          <input id="admin-setup-pw" type="password" className={inputCls} value={pw} onChange={(e) => setPw(e.target.value)} autoComplete="new-password" placeholder="6文字以上" />
-        </div>
-        <div>
-          <label htmlFor="admin-setup-pw2" className={labelCls}>パスワード（もう一度）</label>
-          <input id="admin-setup-pw2" type="password" className={inputCls} value={pw2} onChange={(e) => setPw2(e.target.value)} autoComplete="new-password" placeholder="もう一度入力" />
-        </div>
-        {pw2.length > 0 && pw !== pw2 && <p className="text-lg font-bold text-[var(--red)]">パスワードが一致していません。</p>}
-        {pw.length > 0 && pw.length < 6 && <p className="text-lg font-bold text-[var(--red)]">パスワードは6文字以上にしてください。</p>}
-        {error && <p className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]" role="alert">{error}</p>}
-        <button type="button" className={bigBtnCls} disabled={!valid} onClick={() => mut.mutate()}>
-          {mut.isPending ? "設定しています…" : "パスワードを設定して管理画面へ"}
-        </button>
-      </div>
-    </section>
-  );
-}
-
-function AdminLogin({ onLogin }: { onLogin: (pw: string) => void }) {
-  const [pw, setPw] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [checking, setChecking] = useState(false);
-  const attempt = async () => {
-    if (!pw) return;
-    setChecking(true);
-    setError(null);
-    try {
-      const res = await api.verifyAdminPassword({ password: pw });
-      if (res.ok) onLogin(pw);
-      else {
-        setError("パスワードが違います。もう一度入力してください。");
-        setPw("");
-      }
-    } catch {
-      setError("通信に失敗しました。もう一度お試しください。");
-    } finally {
-      setChecking(false);
-    }
-  };
-  return (
-    <section className="mx-auto max-w-md rounded-[var(--radius)] bg-[var(--surface)] p-5 shadow-sm">
-      <h2 className="text-center text-2xl font-bold">管理者ログイン</h2>
-      <p className="mt-2 text-center text-base text-[var(--dim)]">全体管理ページです。管理者パスワードを入力してください。</p>
-      <div className="mt-4 space-y-4">
-        <div>
-          <label htmlFor="admin-login-pw" className={labelCls}>管理者パスワード</label>
-          <input id="admin-login-pw" type="password" className={inputCls} value={pw} onChange={(e) => setPw(e.target.value)} autoComplete="current-password" placeholder="パスワード" onKeyDown={(e) => { if (e.key === "Enter") void attempt(); }} />
-        </div>
-        {error && <p className="rounded-[var(--radius)] bg-[var(--surface-alt)] p-4 text-lg font-bold text-[var(--red)]" role="alert">{error}</p>}
-        <button type="button" className={bigBtnCls} disabled={!pw || checking} onClick={() => void attempt()}>
-          {checking ? "確認しています…" : "ログイン"}
-        </button>
-      </div>
-    </section>
-  );
-}
-
-function AdminShopSlugEditor({ shop, adminPassword }: { shop: Shop; adminPassword: string }) {
-  const queryClient = useQueryClient();
-  const [slug, setSlug] = useState(shop.slug);
-  const [msg, setMsg] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => { setSlug(shop.slug); }, [shop.slug]);
-  const slugTrim = slug.trim();
-  const valid = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slugTrim) && slugTrim.length >= 2 && slugTrim.length <= 32 && slugTrim !== "owner" && slugTrim !== "admin";
-  const mut = useMutation({
-    mutationFn: () => api.adminUpdateSlug({ adminPassword, shopId: shop.id, slug: slugTrim }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        setMsg("スラッグを変更しました");
-        setError(null);
-        void queryClient.invalidateQueries({ queryKey: ["state"] });
-        void queryClient.invalidateQueries({ queryKey: ["adminShops"] });
-      } else {
-        setError(res.error ?? "変更できませんでした");
-        setMsg(null);
-      }
-    },
-    onError: () => setError("通信に失敗しました"),
-  });
-  return (
-    <div className="mt-3 border-t border-[var(--border)] pt-3">
-      <label htmlFor={`admin-slug-${shop.id}`} className={labelCls}>スラッグを変更</label>
-      <div className="flex flex-col gap-2 sm:flex-row">
-        <input id={`admin-slug-${shop.id}`} className={inputCls} value={slug} onChange={(e) => setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))} autoComplete="off" autoCapitalize="none" spellCheck={false} placeholder="例：shop1" aria-label={`${shop.name}のスラッグ`} />
-        <button type="button" className="min-h-14 shrink-0 rounded-[var(--radius)] bg-[var(--accent)] px-5 text-lg font-bold text-[var(--accent-text)] disabled:opacity-40" disabled={!valid || slugTrim === shop.slug || mut.isPending} onClick={() => mut.mutate()}>
-          {mut.isPending ? "保存中…" : "スラッグを保存"}
-        </button>
-      </div>
-      <p className="mt-1 text-sm text-[var(--dim)]">英小文字・数字・ハイフンで2〜32文字。他店と重複不可、「owner」「admin」は使用不可。変更すると古いURLは使えなくなります。</p>
-      {!valid && slugTrim.length > 0 && <p className="mt-1 text-base font-bold text-[var(--red)]">スラッグの形式が正しくありません。</p>}
-      {error && <p className="mt-1 text-base font-bold text-[var(--red)]">{error}</p>}
-      {msg && <p className="mt-1 text-base font-bold text-[var(--green)]">{msg}</p>}
-    </div>
-  );
-}
-
-function AdminDashboard({ adminPassword, onLogout, onPasswordChanged }: { adminPassword: string; onLogout: () => void; onPasswordChanged: (newPw: string) => void }) {
-  const queryClient = useQueryClient();
-  const shopsQ = useQuery({ queryKey: ["adminShops"], queryFn: () => api.adminListShops({ adminPassword }) });
-  const shops = shopsQ.data?.shops ?? [];
-
-  const [newName, setNewName] = useState("");
-  const [newSlug, setNewSlug] = useState("");
-  const [newAddress, setNewAddress] = useState("");
-  const [newPhone, setNewPhone] = useState("");
-  const [createMsg, setCreateMsg] = useState<string | null>(null);
-  const [createError, setCreateError] = useState<string | null>(null);
-
-  const newSlugTrim = newSlug.trim();
-  const newSlugValid = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(newSlugTrim) && newSlugTrim.length >= 2 && newSlugTrim.length <= 32 && newSlugTrim !== "owner" && newSlugTrim !== "admin";
-  const slugTaken = shops.some((s) => s.slug === newSlugTrim);
-
-  const createMut = useMutation({
-    mutationFn: () => api.adminCreateShop({ adminPassword, name: newName.trim(), slug: newSlugTrim, address: newAddress.trim(), phone: newPhone.trim() }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        setCreateMsg(`店舗「${newName.trim()}」を追加しました（スラッグ：${newSlugTrim}）`);
-        setCreateError(null);
-        setNewName("");
-        setNewSlug("");
-        setNewAddress("");
-        setNewPhone("");
-        void queryClient.invalidateQueries({ queryKey: ["state"] });
-        void queryClient.invalidateQueries({ queryKey: ["adminShops"] });
-      } else {
-        setCreateError(res.error ?? "作成できませんでした");
-        setCreateMsg(null);
-      }
-    },
-    onError: () => setCreateError("通信に失敗しました"),
-  });
-
-  const [curPw, setCurPw] = useState("");
-  const [newPw, setNewPw] = useState("");
-  const [newPw2, setNewPw2] = useState("");
-  const [pwMsg, setPwMsg] = useState<string | null>(null);
-  const [pwError, setPwError] = useState<string | null>(null);
-  const changePwMut = useMutation({
-    mutationFn: () => api.changeAdminPassword({ currentPassword: curPw, newPassword: newPw }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        onPasswordChanged(newPw);
-        setPwMsg("管理者パスワードを変更しました。次回から新しいパスワードでログインしてください。");
-        setPwError(null);
-        setCurPw("");
-        setNewPw("");
-        setNewPw2("");
-      } else {
-        setPwError(res.error ?? "変更できませんでした");
-        setPwMsg(null);
-      }
-    },
-    onError: () => setPwError("通信に失敗しました"),
-  });
-  const pwValid = curPw.length > 0 && newPw.length >= 6 && newPw === newPw2 && !changePwMut.isPending;
-
-  return (
-    <div className="space-y-8 pt-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-3xl font-bold">全体管理（admin）</h1>
-          <p className="mt-1 text-base text-[var(--dim)]">店舗の追加とスラッグ管理を行います。店舗の削除はできません。</p>
-        </div>
-        <button type="button" className="min-h-12 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold" onClick={onLogout} aria-label="管理者ログアウト">
-          ログアウト
-        </button>
-      </div>
-
-      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-        <h2 className="text-2xl font-bold">店舗一覧</h2>
-        {shopsQ.isPending && <p className="mt-3 text-lg text-[var(--dim)]">読み込んでいます…</p>}
-        {shopsQ.error && <p className="mt-3 text-lg font-bold text-[var(--red)]">店舗一覧を読み込めませんでした。ログアウトして入り直してください。</p>}
-        <div className="mt-4 space-y-4">
-          {shops.map((s) => (
-            <article key={s.id} className="rounded-[var(--radius)] border-2 border-[var(--border)] p-4" aria-label={`${s.name}の情報`}>
-              <div className="flex flex-wrap items-start justify-between gap-2">
-                <h3 className="text-2xl font-bold">{s.name}</h3>
-                <span className={`rounded-full px-3 py-1 text-sm font-bold ${s.pinNeedsSetup ? "bg-[var(--surface-alt)] text-[var(--red)]" : "bg-[var(--surface-alt)] text-[var(--green)]"}`}>
-                  店主暗証番号：{s.pinNeedsSetup ? "未設定" : "設定済み"}
-                </span>
-              </div>
-              <dl className="mt-3 space-y-2 text-base">
-                <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">スラッグ</dt><dd className="font-mono">{s.slug}</dd></div>
-                <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">お客さん用URL</dt><dd className="break-all font-mono">/{s.slug}</dd></div>
-                <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">店主用URL</dt><dd className="break-all font-mono">/{s.slug}/owner</dd></div>
-                <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">営業時間</dt><dd>{s.openTime}〜{s.closeTime}／枠{s.slotMinutes}分／椅子{s.chairs}台</dd></div>
-                {s.address && <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">住所</dt><dd>{s.address}</dd></div>}
-                {s.phone && <div className="flex flex-col sm:flex-row sm:gap-2"><dt className="shrink-0 font-bold">電話</dt><dd>{s.phone}</dd></div>}
-              </dl>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <a href={`/${s.slug}`} className="min-h-11 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 py-2 text-base font-bold" aria-label={`${s.name}のお客さん用ページを開く`}>お客さん用を開く</a>
-                <a href={`/${s.slug}/owner`} className="min-h-11 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 py-2 text-base font-bold" aria-label={`${s.name}の店主用ページを開く`}>店主用を開く</a>
-              </div>
-              <AdminShopSlugEditor shop={s} adminPassword={adminPassword} />
-            </article>
-          ))}
-          {!shopsQ.isPending && shops.length === 0 && <p className="text-lg text-[var(--dim)]">店舗がありません。下のフォームから追加できます。</p>}
-        </div>
-      </section>
-
-      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-        <h2 className="text-2xl font-bold">店舗を追加</h2>
-        <p className="mt-1 text-base text-[var(--dim)]">店名とスラッグが必須です。初期設定は営業時間09:00–19:00、枠30分、椅子1台、定休日は月曜＋第2・第3火曜、デフォルトメニュー6種が入ります。店主暗証番号は未設定で作られ、店主本人が後で初回設定します。</p>
-        <div className="mt-4 space-y-4">
-          <div>
-            <label htmlFor="admin-new-name" className={labelCls}>店名（必須）</label>
-            <input id="admin-new-name" className={inputCls} value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="例：○○理容室" />
-          </div>
-          <div>
-            <label htmlFor="admin-new-slug" className={labelCls}>スラッグ（必須）</label>
-            <input id="admin-new-slug" className={inputCls} value={newSlug} onChange={(e) => setNewSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))} placeholder="例：shop3" autoComplete="off" autoCapitalize="none" spellCheck={false} />
-            <p className="mt-1 text-sm text-[var(--dim)]">お客さん用：/{newSlugTrim || "…"} ／ 店主用：/{newSlugTrim || "…"}/owner</p>
-            {newSlugTrim.length > 0 && !newSlugValid && <p className="mt-1 text-base font-bold text-[var(--red)]">スラッグの形式が正しくありません（「owner」「admin」は使えません）。</p>}
-            {newSlugValid && slugTaken && <p className="mt-1 text-base font-bold text-[var(--red)]">このスラッグは既に使われています。</p>}
-          </div>
-          <div>
-            <label htmlFor="admin-new-address" className={labelCls}>住所（任意）</label>
-            <input id="admin-new-address" className={inputCls} value={newAddress} onChange={(e) => setNewAddress(e.target.value)} placeholder="例：東京都○○区…" />
-          </div>
-          <div>
-            <label htmlFor="admin-new-phone" className={labelCls}>電話番号（任意）</label>
-            <input id="admin-new-phone" className={inputCls} value={newPhone} onChange={(e) => setNewPhone(e.target.value)} placeholder="例：03-1234-5678" inputMode="tel" />
-          </div>
-          {createError && <p className="text-lg font-bold text-[var(--red)]" role="alert">{createError}</p>}
-          {createMsg && <p className="text-lg font-bold text-[var(--green)]" role="status">{createMsg}</p>}
-          <button type="button" className={bigBtnCls} disabled={newName.trim().length === 0 || !newSlugValid || slugTaken || createMut.isPending} onClick={() => createMut.mutate()}>
-            {createMut.isPending ? "追加しています…" : "店舗を追加する"}
-          </button>
-        </div>
-      </section>
-
-      <section className="rounded-[var(--radius)] bg-[var(--surface)] p-4 shadow-sm">
-        <h2 className="text-2xl font-bold">管理者パスワードの変更</h2>
-        <p className="mt-1 text-base text-[var(--dim)]">変更には今のパスワードの照合が必要です。パスワードはハッシュ化して保存されます。</p>
-        <div className="mt-4 space-y-4">
-          <div>
-            <label htmlFor="admin-pw-cur" className={labelCls}>今のパスワード</label>
-            <input id="admin-pw-cur" type="password" className={inputCls} value={curPw} onChange={(e) => setCurPw(e.target.value)} autoComplete="current-password" />
-          </div>
-          <div>
-            <label htmlFor="admin-pw-new" className={labelCls}>新しいパスワード（6文字以上）</label>
-            <input id="admin-pw-new" type="password" className={inputCls} value={newPw} onChange={(e) => setNewPw(e.target.value)} autoComplete="new-password" />
-          </div>
-          <div>
-            <label htmlFor="admin-pw-new2" className={labelCls}>新しいパスワード（もう一度）</label>
-            <input id="admin-pw-new2" type="password" className={inputCls} value={newPw2} onChange={(e) => setNewPw2(e.target.value)} autoComplete="new-password" />
-          </div>
-          {newPw2.length > 0 && newPw !== newPw2 && <p className="text-lg font-bold text-[var(--red)]">新しいパスワードが一致していません。</p>}
-          {newPw.length > 0 && newPw.length < 6 && <p className="text-lg font-bold text-[var(--red)]">新しいパスワードは6文字以上にしてください。</p>}
-          {pwError && <p className="text-lg font-bold text-[var(--red)]">{pwError}</p>}
-          {pwMsg && <p className="text-lg font-bold text-[var(--green)]">{pwMsg}</p>}
-          <button type="button" className={bigBtnCls} disabled={!pwValid} onClick={() => changePwMut.mutate()}>
-            パスワードを変更する
-          </button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function AdminPage() {
-  const statusQ = useQuery({ queryKey: ["adminStatus"], queryFn: () => api.getAdminStatus({}) });
-  const [adminPassword, setAdminPassword] = useState<string | null>(() => loadAdminPassword());
-  const [verified, setVerified] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    try {
-      if (adminPassword) window.sessionStorage.setItem(ADMIN_STORAGE_KEY, adminPassword);
-      else window.sessionStorage.removeItem(ADMIN_STORAGE_KEY);
-    } catch { /* 保存できなくても動作は続ける */ }
-  }, [adminPassword]);
-
-  useEffect(() => {
-    if (!adminPassword) { setVerified(null); return; }
-    let cancelled = false;
-    void (async () => {
-      try {
-        const res = await api.verifyAdminPassword({ password: adminPassword });
-        if (!cancelled) {
-          setVerified(res.ok);
-          if (!res.ok) setAdminPassword(null);
-        }
-      } catch {
-        if (!cancelled) setVerified(false);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [adminPassword]);
-
-  if (statusQ.isPending) return <p className="py-16 text-center text-xl">読み込んでいます…</p>;
-  if (statusQ.error) return <p className="py-16 text-center text-xl font-bold text-[var(--red)]">読み込みに失敗しました</p>;
-  const needsSetup = statusQ.data?.needsSetup ?? false;
-
-  if (needsSetup) {
-    return (
-      <div className="pt-6">
-        <AdminSetup onSetup={(pw) => { setAdminPassword(pw); setVerified(true); }} />
-      </div>
-    );
-  }
-
-  if (!adminPassword || verified === false) {
-    return (
-      <div className="pt-6">
-        <AdminLogin onLogin={(pw) => { setAdminPassword(pw); setVerified(true); }} />
-      </div>
-    );
-  }
-
-  if (verified === null) return <p className="py-16 text-center text-xl">確認しています…</p>;
-
-  return (
-    <AdminDashboard
-      adminPassword={adminPassword}
-      onLogout={() => { setAdminPassword(null); setVerified(null); }}
-      onPasswordChanged={(newPw) => setAdminPassword(newPw)}
-    />
-  );
-}
-
-// ---------- root ----------
-
-const OWNER_PIN_STORAGE_KEY = "barber-owner-pins";
-
-function loadOwnerPins(): Record<number, string> {
-  try {
-    const raw = window.sessionStorage.getItem(OWNER_PIN_STORAGE_KEY);
-    if (!raw) return {};
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null) return {};
-    const out: Record<number, string> = {};
-    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if (typeof v === "string" && /^\d{4}$/.test(v)) out[Number(k)] = v;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
-export function App() {
-  const stateQ = useQuery({ queryKey: ["state"], queryFn: () => api.getState({}) });
-  const route = useRoute();
-  const [ownerTab, setOwnerTab] = useState<"bookings" | "calendar" | "settings">("bookings");
-  // 店舗ごとに認証済みの暗証番号（このタブを開いている間だけ保持）
-  const [ownerPins, setOwnerPins] = useState<Record<number, string>>(loadOwnerPins);
-
-  useEffect(() => {
-    try {
-      window.sessionStorage.setItem(OWNER_PIN_STORAGE_KEY, JSON.stringify(ownerPins));
-    } catch {
-      // 保存できなくても動作は続ける
-    }
-  }, [ownerPins]);
-
-  const state = stateQ.data;
-  const routeSlug =
-    route.kind === "customer" || route.kind === "owner" || route.kind === "unknown"
-      ? route.slug
-      : null;
-  const shop =
-    state && routeSlug !== null
-      ? (state.shops.find((s) => s.slug === routeSlug) ?? null)
-      : null;
-  const ownerPin = shop ? ownerPins[shop.id] : undefined;
-  const ownerAuthed = ownerPin !== undefined;
-
-  // 全体管理ページ（/admin）は店舗の状態に依存しない専用画面。
-  // 入口・お客さん用・店主用のどこにもリンクは置いていない。
-  if (route.kind === "admin") {
-    return (
-      <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
-        <SafeAreaTopScrim backgroundColor="var(--bg)" />
-        <main className="mx-auto w-full max-w-2xl px-4 pb-16">
-          <AdminPage />
-        </main>
-      </div>
-    );
-  }
-
-  return (
-    <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
-      <SafeAreaTopScrim backgroundColor="var(--bg)" />
-      <main className="mx-auto w-full max-w-2xl px-4 pb-16">
-        {stateQ.isPending && (
-          <p className="py-16 text-center text-xl">読み込んでいます…</p>
-        )}
-        {stateQ.error && (
-          <div className="py-16 text-center">
-            <p className="text-xl font-bold text-[var(--red)]">読み込みに失敗しました</p>
-            <button
-              type="button"
-              className={`${bigBtnCls} mt-4`}
-              onClick={() => void stateQ.refetch()}
-            >
-              もう一度読み込む
-            </button>
-          </div>
-        )}
-
-        {state && route.kind === "entrance" && (
-          <div className="pt-6">
-            <h1 className="text-3xl font-bold">お店を選んでください</h1>
-            <p className="mt-2 text-lg text-[var(--dim)]">
-              ご予約のお店をタップすると、そのお店専用の予約ページが開きます。
-            </p>
-            <div className="mt-5 space-y-4">
-              {state.shops.map((s) => (
-                <a
-                  key={s.id}
-                  href={`/${s.slug}`}
-                  className="block rounded-[var(--radius)] border-2 border-[var(--border)] bg-[var(--surface)] p-5 shadow-sm"
-                  aria-label={`${s.name}の予約ページを開く`}
-                >
-                  <p className="text-3xl font-bold">{s.name}</p>
-                  <div className="mt-2 space-y-1 text-lg">
-                    <p>
-                      営業時間：{s.openTime}〜{s.closeTime}
-                    </p>
-                    <p>定休日：{closedSummary(s)}</p>
-                    {s.address && <p>住所：{s.address}</p>}
-                    {s.phone && <p>電話：{s.phone}</p>}
-                  </div>
-                  <p className="mt-4 min-h-14 rounded-[var(--radius)] bg-[var(--accent)] px-4 py-3 text-center text-xl font-bold text-[var(--accent-text)]">
-                    このお店で予約する
-                  </p>
-                </a>
-              ))}
-              {state.shops.length === 0 && (
-                <p className="text-lg text-[var(--dim)]">お店が登録されていません。</p>
-              )}
-            </div>
-            <p className="mt-6 text-base text-[var(--dim)]">
-              ホーム画面への追加は、各お店の予約ページを開いてから行ってください。お店ごとに専用のページがあります。
-            </p>
-          </div>
-        )}
-
-        {state && route.kind !== "entrance" && shop === null && (
-          <div className="py-16 text-center">
-            <p className="text-2xl font-bold">そのURLのお店は見つかりませんでした</p>
-            <p className="mt-3 text-lg text-[var(--dim)]">
-              URLが変わっているか、入力が間違っている可能性があります。下のボタンからお店を選び直してください。
-            </p>
-            <a
-              href="/"
-              className={`${bigBtnCls} mt-6 block py-3 text-center`}
-              aria-label="店舗入口ページへ移動する"
-            >
-              店舗入口へ
-            </a>
-          </div>
-        )}
-
-        {state && shop && route.kind === "customer" && (
-          <>
-            <div className="pt-4">
-              <ShopInfoCard shop={shop} />
-            </div>
-            <div className="mt-6">
-              <BookingFlow key={`bf-${shop.id}`} state={state} shop={shop} />
-              <MyBookings key={`mb-${shop.id}`} shop={shop} />
-              <InstallGuide shop={shop} />
-            </div>
-            <p className="mt-8 text-center">
-              <a href="/" className="text-base font-bold text-[var(--accent)] underline">
-                ほかのお店を選ぶ（店舗入口へ）
-              </a>
-            </p>
-          </>
-        )}
-
-        {state && shop && route.kind === "owner" && (
-          <>
-            <div className="pt-4">
-              <ShopInfoCard shop={shop} showSetupHint />
-            </div>
-            <div className="mt-6">
-              {shop.pinNeedsSetup ? (
-                <SetupPin
-                  key={`sup-${shop.id}`}
-                  shop={shop}
-                  onSetup={(pin) =>
-                    setOwnerPins((prev) => ({ ...prev, [shop.id]: pin }))
-                  }
-                  onBack={() => navigateTo("/")}
+            <Card>
+              <h2 className="text-lg font-bold">管理者パスワードの変更</h2>
+              <div className="mt-4 space-y-4">
+                <TextInput
+                  label="新しいパスワード"
+                  type="password"
+                  value={newAdminPw}
+                  onChange={setNewAdminPw}
+                  autoComplete="new-password"
                 />
-              ) : !ownerAuthed || ownerPin === undefined ? (
-                <PinGate
-                  key={`pin-${shop.id}`}
-                  shop={shop}
-                  onSuccess={(pin) =>
-                    setOwnerPins((prev) => ({ ...prev, [shop.id]: pin }))
-                  }
-                  onBack={() => navigateTo("/")}
-                />
-              ) : (
-                <>
-                  <div className="mb-4 flex items-center justify-between gap-3">
-                    <p className="text-lg font-bold">
-                      {shop.name} の店主画面
-                    </p>
-                    <button
-                      type="button"
-                      className="min-h-12 shrink-0 rounded-[var(--radius)] bg-[var(--surface-alt)] px-4 text-lg font-bold"
-                      onClick={() =>
-                        setOwnerPins((prev) => {
-                          const next = { ...prev };
-                          delete next[shop.id];
-                          return next;
-                        })
-                      }
-                    >
-                      ロックする
-                    </button>
-                  </div>
-                  <div className="mb-5 grid grid-cols-3 gap-2" role="tablist" aria-label="店主画面の切り替え">
-                    {(
-                      [
-                        ["bookings", "予約一覧"],
-                        ["calendar", "営業日編集"],
-                        ["settings", "設定"],
-                      ] as const
-                    ).map(([key, label]) => (
-                      <button
-                        key={key}
-                        type="button"
-                        role="tab"
-                        aria-selected={ownerTab === key}
-                        onClick={() => setOwnerTab(key)}
-                        className={`min-h-12 rounded-[var(--radius)] px-2 text-lg font-bold ${
-                          ownerTab === key
-                            ? "bg-[var(--accent)] text-[var(--accent-text)]"
-                            : "bg-[var(--surface-alt)] text-[var(--text)]"
-                        }`}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                  {ownerTab === "bookings" && (
-                    <OwnerBookings key={`ob-${shop.id}`} state={state} shop={shop} ownerPin={ownerPin} />
-                  )}
-                  {ownerTab === "calendar" && (
-                    <CalendarEdit key={`ce-${shop.id}`} state={state} shop={shop} ownerPin={ownerPin} />
-                  )}
-                  {ownerTab === "settings" && (
-                    <Settings
-                      key={`st-${shop.id}`}
-                      state={state}
-                      shop={shop}
-                      ownerPin={ownerPin}
-                      onPinChanged={(id, newPin) =>
-                        setOwnerPins((prev) => ({ ...prev, [id]: newPin }))
-                      }
-                      onSlugChanged={(newSlug) => navigateTo(`/${newSlug}/owner`)}
-                    />
-                  )}
-                </>
-              )}
-            </div>
-          </>
+                {adminPwMsg ? (
+                  <p className="rounded-2xl px-4 py-3 text-sm" style={{ background: "var(--accent-soft)" }}>
+                    {adminPwMsg}
+                  </p>
+                ) : null}
+                <PrimaryButton onClick={() => void changeAdminPw()}>変更する</PrimaryButton>
+              </div>
+            </Card>
+          </div>
         )}
       </main>
     </div>
   );
+}
+
+// ---------- router ----------
+
+export function App() {
+  const segments = window.location.pathname.split("/").filter(Boolean);
+  if (segments.length === 0) return <LandingPage />;
+  const [first, second] = segments;
+  if (first === "login" && segments.length === 1) return <LoginPage />;
+  if (first === "signup" && segments.length === 1) return <SignupPage />;
+  if (first === "admin" && segments.length === 1) return <AdminPage />;
+  if (segments.length === 1) return <PublicCalendarPage slug={first as string} />;
+  if (segments.length === 2 && second === "edit") {
+    return <EditPage slug={first as string} />;
+  }
+  if (segments.length === 2) {
+    return <RedeemPage slug={first as string} token={second as string} />;
+  }
+  return <PublicCalendarPage slug={first as string} />;
 }
