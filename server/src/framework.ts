@@ -21,6 +21,18 @@ export interface Ctx {
    * no-op kept for API compatibility with the handlers.
    */
   invalidateQueries: () => void;
+  /**
+   * Raw session token from the request's session cookie, or null when the
+   * request carries none. Handlers resolve it against the sessions table.
+   */
+  sessionToken: string | null;
+  /** True when the request arrived over HTTPS (session cookie gets Secure). */
+  secureCookie: boolean;
+  /**
+   * Set-Cookie header values queued by handlers (login / logout / edit
+   * link redemption). The server layer appends them to the response.
+   */
+  setCookies: string[];
 }
 
 export interface ActionDef<Req, Res> {

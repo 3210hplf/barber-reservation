@@ -29,13 +29,18 @@ export function runMigrations(): void {
   migrate(db, { migrationsFolder: path.join(repoRoot, "drizzle") });
 }
 
-/** Build the Ctx object passed to action handlers. */
-export function createCtx(): Ctx {
+/** Build the per-request Ctx object passed to action handlers. */
+export function createCtx(
+  opts: { sessionToken?: string | null; secureCookie?: boolean } = {},
+): Ctx {
   return {
     db: <TSchema extends Record<string, unknown>>() =>
       db as unknown as BunSQLiteDatabase<TSchema>,
     invalidateQueries: () => {
       // No-op locally: the web client invalidates its own queries.
     },
+    sessionToken: opts.sessionToken ?? null,
+    secureCookie: opts.secureCookie ?? false,
+    setCookies: [],
   };
 }

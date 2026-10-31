@@ -61,7 +61,7 @@ export const api = createActionClient<typeof Actions>();
 // Convenience types so client code can do
 //
 //     import { api, type ApiResponse } from "./api";
-//     type Shop = ApiResponse<typeof api, "getState">["shops"][number];
+//     type Shop = ApiResponse<typeof api, "getCalendar">["shop"];
 export type ApiRequest<C, K extends keyof C> =
   C[K] extends (args: infer A) => unknown ? A : never;
 export type ApiResponse<C, K extends keyof C> =

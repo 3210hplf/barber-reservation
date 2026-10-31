@@ -4,11 +4,6 @@ import * as schema from "./schema";
 
 // ---------- helpers ----------
 
-function toMin(t: string): number {
-  const [h = 0, m = 0] = t.split(":").map(Number);
-  return h * 60 + m;
-}
-
 function todayJST(): string {
   return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Tokyo" });
 }
@@ -40,33 +35,17 @@ function parseNth(json: string): NthClosure[] {
 }
 
 type ShopRow = typeof schema.shops.$inferSelect;
-type OverrideRow = typeof schema.dayOverrides.$inferSelect;
 
-function isOpenDay(shop: ShopRow, overrides: OverrideRow[], date: string): boolean {
-  const ov = overrides.find((o) => o.shopId === shop.id && o.date === date);
-  if (ov) return ov.kind === "open";
-  const d = new Date(`${date}T00:00:00`);
-  const weekday = d.getDay();
-  if (parseWeekdays(shop.closedWeekdays).includes(weekday)) return false;
-  const nth = Math.ceil(d.getDate() / 7);
-  if (parseNth(shop.nthClosures).some((c) => c.nth === nth && c.weekday === weekday)) return false;
-  return true;
-}
-
-function digits(s: string): string {
-  return s.replace(/[^0-9]/g, "");
-}
-
-// ---------- owner PIN hashing ----------
+// ---------- password hashing (PBKDF2) ----------
 //
-// Owner PINs are never stored in plaintext. They are stored in the
-// owner_pin column as `pbkdf2$<iterations>$<salt base64>$<hash base64>`
-// (PBKDF2-HMAC-SHA-256 with a per-shop random salt). Web Crypto
-// (crypto.subtle) is available in both Bun and Cloudflare Workers, so the
-// same code path runs in both environments. An empty owner_pin means the
-// PIN has not been set up yet.
+// Passwords are never stored in plaintext. They are stored as
+// `pbkdf2$<iterations>$<salt base64>$<hash base64>` (PBKDF2-HMAC-SHA-256
+// with a per-account random salt). Web Crypto (crypto.subtle) is
+// available in both Bun and Cloudflare Workers, so the same code path
+// runs in both environments. An empty stored hash means "no password
+// set" (login impossible). There is no known default password anywhere.
 
-const PIN_ITERATIONS = 10000;
+const PASSWORD_ITERATIONS = 120000;
 
 function toB64(bytes: Uint8Array): string {
   let bin = "";
@@ -81,10 +60,10 @@ function fromB64(s: string): Uint8Array {
   return out;
 }
 
-async function pbkdf2(pin: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+async function pbkdf2(secret: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
   const key = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(pin),
+    new TextEncoder().encode(secret),
     "PBKDF2",
     false,
     ["deriveBits"],
@@ -93,8 +72,6 @@ async function pbkdf2(pin: string, salt: Uint8Array, iterations: number): Promis
     {
       name: "PBKDF2",
       hash: "SHA-256",
-      // Hand deriveBits an exact-size copy of the salt buffer (the salt
-      // arrays used here are always freshly allocated, never views).
       salt: salt.slice().buffer as ArrayBuffer,
       iterations,
     },
@@ -104,18 +81,13 @@ async function pbkdf2(pin: string, salt: Uint8Array, iterations: number): Promis
   return new Uint8Array(bits);
 }
 
-// Hashes a secret into the `pbkdf2$<iterations>$<salt>$<hash>` storage
-// format. Used for owner PINs (PIN_ITERATIONS) and for the admin password
-// (ADMIN_PASSWORD_ITERATIONS, defined with the admin helpers below).
-// verifyPin() below reads the iteration count back out of the stored
-// string, so it verifies either kind of secret unchanged.
-async function hashPin(pin: string, iterations: number = PIN_ITERATIONS): Promise<string> {
+async function hashSecret(secret: string, iterations: number = PASSWORD_ITERATIONS): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const hash = await pbkdf2(pin, salt, iterations);
+  const hash = await pbkdf2(secret, salt, iterations);
   return `pbkdf2$${iterations}$${toB64(salt)}$${toB64(hash)}`;
 }
 
-async function verifyPin(stored: string, pin: string): Promise<boolean> {
+async function verifySecret(stored: string, secret: string): Promise<boolean> {
   if (!stored) return false;
   const parts = stored.split("$");
   if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
@@ -125,7 +97,7 @@ async function verifyPin(stored: string, pin: string): Promise<boolean> {
   let actual: Uint8Array;
   try {
     expected = fromB64(parts[3] as string);
-    actual = await pbkdf2(pin, fromB64(parts[2] as string), iterations);
+    actual = await pbkdf2(secret, fromB64(parts[2] as string), iterations);
   } catch {
     return false;
   }
@@ -135,14 +107,147 @@ async function verifyPin(stored: string, pin: string): Promise<boolean> {
   return diff === 0;
 }
 
-const DEFAULT_MENUS: { name: string; price: number; minutes: number }[] = [
-  { name: "カット", price: 4000, minutes: 60 },
-  { name: "カット＋顔剃り", price: 4500, minutes: 60 },
-  { name: "カット＋シャンプー", price: 4500, minutes: 60 },
-  { name: "顔剃り", price: 1500, minutes: 30 },
-  { name: "カラー（白髪染め）", price: 6000, minutes: 90 },
-  { name: "パーマ", price: 8000, minutes: 120 },
-];
+// ---------- token hashing (sessions / edit links) ----------
+//
+// Session tokens and edit-link UUIDs are bearer secrets. Only their
+// SHA-256 hash is stored in the database; the plaintext is handed to
+// the client exactly once (cookie / one-time display).
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function hashesEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function randomToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// ---------- sessions ----------
+
+export const SESSION_COOKIE_NAME = "cal_session";
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function queueSessionCookie(ctx: Ctx, token: string, maxAgeSeconds: number): void {
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${token}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+  if (ctx.secureCookie) parts.push("Secure");
+  ctx.setCookies.push(parts.join("; "));
+}
+
+async function createSession(
+  ctx: Ctx,
+  shopId: number,
+  scope: "owner" | "editlink",
+): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  const token = randomToken();
+  const now = Date.now();
+  await db.insert(schema.sessions).values({
+    tokenHash: await sha256Hex(token),
+    shopId,
+    scope,
+    expiresAt: now + SESSION_TTL_MS,
+    createdAt: now,
+  });
+  queueSessionCookie(ctx, token, Math.floor(SESSION_TTL_MS / 1000));
+}
+
+type SessionInfo = {
+  shop: ShopRow;
+  scope: "owner" | "editlink";
+};
+
+async function resolveSession(ctx: Ctx): Promise<SessionInfo | null> {
+  if (!ctx.sessionToken) return null;
+  const db = ctx.db<typeof schema>();
+  const tokenHash = await sha256Hex(ctx.sessionToken);
+  const rows = await db
+    .select()
+    .from(schema.sessions)
+    .where(eq(schema.sessions.tokenHash, tokenHash));
+  const session = rows[0];
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) {
+    await db.delete(schema.sessions).where(eq(schema.sessions.id, session.id));
+    return null;
+  }
+  const shopRows = await db
+    .select()
+    .from(schema.shops)
+    .where(eq(schema.shops.id, session.shopId));
+  const shop = shopRows[0];
+  if (!shop) return null;
+  return { shop, scope: session.scope };
+}
+
+// Editing requires a session (owner login or edit link) for THAT shop.
+async function requireShopSession(ctx: Ctx, slug: string): Promise<SessionInfo> {
+  const info = await resolveSession(ctx);
+  if (!info || info.shop.slug !== slug) {
+    throw new Error("編集するにはログイン（または編集リンク）が必要です");
+  }
+  return info;
+}
+
+async function findShopBySlug(ctx: Ctx, slug: string): Promise<ShopRow | undefined> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select().from(schema.shops).where(eq(schema.shops.slug, slug));
+  return rows[0];
+}
+
+async function touchUpdatedAt(ctx: Ctx, shopId: number): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  await db
+    .update(schema.shops)
+    .set({ updatedAt: Date.now() })
+    .where(eq(schema.shops.id, shopId));
+}
+
+// ---------- slug / theme validation ----------
+
+const RESERVED_SLUGS = new Set([
+  "admin", "login", "signup", "api", "actions", "owner", "edit", "logout",
+  "help", "about", "terms", "privacy", "support", "www", "mail", "static",
+  "public", "index", "home", "new", "register", "account", "settings",
+  "calendar", "assets",
+]);
+
+const slugSchema = z
+  .string()
+  .min(3)
+  .max(30)
+  .regex(/^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/, "IDは英小文字・数字・ハイフン・アンダースコアで、先頭と末尾は英数字にしてください");
+
+function slugError(slug: string): string | null {
+  if (RESERVED_SLUGS.has(slug)) return `「${slug}」はIDに使えません`;
+  return null;
+}
+
+export const THEMES = ["standard", "warm", "sakura", "forest", "ocean", "mono"] as const;
+
+// ---------- seed (local dev only) ----------
+//
+// Used by `bun run db:migrate` for local development. The demo accounts
+// have NO password and NO edit token, so nobody can log in to them or
+// edit them; they exist only so the public calendar can be previewed.
+// On Workers/D1 nothing is seeded — accounts are created via signup.
 
 export async function seedIfEmpty(ctx: Ctx) {
   const db = ctx.db<typeof schema>();
@@ -153,90 +258,89 @@ export async function seedIfEmpty(ctx: Ctx) {
     { name: "おじさんの店", slug: "shop2" },
   ];
   for (const d of defaults) {
-    const inserted = await db
-      .insert(schema.shops)
-      .values({
-        name: d.name,
-        slug: d.slug,
-        ownerPin: "",
-        pinChanged: 0,
-        openTime: "09:00",
-        closeTime: "19:00",
-        slotMinutes: 30,
-        chairs: 1,
-        closedWeekdays: JSON.stringify([1]),
-        nthClosures: JSON.stringify([
-          { nth: 2, weekday: 2 },
-          { nth: 3, weekday: 2 },
-        ]),
-      })
-      .returning({ id: schema.shops.id });
-    const shop = inserted[0];
-    if (!shop) continue;
-    for (let i = 0; i < DEFAULT_MENUS.length; i++) {
-      const m = DEFAULT_MENUS[i];
-      if (!m) continue;
-      await db.insert(schema.menus).values({
-        shopId: shop.id,
-        name: m.name,
-        price: m.price,
-        minutes: m.minutes,
-        sortOrder: i,
-      });
-    }
+    await db.insert(schema.shops).values({
+      name: d.name,
+      slug: d.slug,
+      passwordHash: "",
+      editTokenHash: "",
+      openTime: "09:00",
+      closeTime: "19:00",
+      closedWeekdays: JSON.stringify([1]),
+      nthClosures: JSON.stringify([
+        { nth: 2, weekday: 2 },
+        { nth: 3, weekday: 2 },
+      ]),
+      updatedAt: Date.now(),
+    });
   }
 }
 
 // ---------- shared shapes ----------
 
-const shopShape = z.object({
-  id: z.number(),
+// Public shop shape: NEVER includes password_hash / edit_token_hash or
+// any other secret column. This is all a visitor of /<slug> may see.
+const publicShopShape = z.object({
   slug: z.string(),
   name: z.string(),
   address: z.string(),
   phone: z.string(),
   openTime: z.string(),
   closeTime: z.string(),
-  slotMinutes: z.number(),
-  chairs: z.number(),
   closedWeekdays: z.array(z.number()),
   nthClosures: z.array(z.object({ nth: z.number(), weekday: z.number() })),
-  // 暗証番号そのものはクライアントへ渡さず、未設定かどうかだけ渡す
-  pinNeedsSetup: z.boolean(),
+  message: z.string(),
+  theme: z.string(),
+  instagramUrl: z.string(),
+  updatedAt: z.string().nullable(), // ISO string, null = never updated
 });
 
-async function requireOwnerPin(ctx: Ctx, shopId: number, pin: string): Promise<ShopRow> {
-  const db = ctx.db<typeof schema>();
-  const rows = await db.select().from(schema.shops).where(eq(schema.shops.id, shopId));
-  const shop = rows[0];
-  if (!shop) throw new Error("お店が見つかりません");
-  if (!(await verifyPin(shop.ownerPin, pin))) throw new Error("暗証番号が違います");
-  // 暗証番号が未設定の間は店主操作はできない（初回設定だけが可能）
-  if (shop.pinChanged === 0) {
-    throw new Error("暗証番号がまだ設定されていません。店主画面の初回設定をしてください");
-  }
-  return shop;
+type PublicShop = z.infer<typeof publicShopShape>;
+
+function toPublicShop(s: ShopRow): PublicShop {
+  return {
+    slug: s.slug,
+    name: s.name,
+    address: s.address,
+    phone: s.phone,
+    openTime: s.openTime,
+    closeTime: s.closeTime,
+    closedWeekdays: parseWeekdays(s.closedWeekdays),
+    nthClosures: parseNth(s.nthClosures),
+    message: s.message,
+    theme: s.theme,
+    instagramUrl: s.instagramUrl,
+    updatedAt: s.updatedAt > 0 ? new Date(s.updatedAt).toISOString() : null,
+  };
 }
 
-const pinResultShape = z.object({
+const overrideShape = z.object({
+  date: z.string(),
+  kind: z.string(),
+  note: z.string(),
+  hours: z.string(),
+});
+
+const resultShape = z.object({
   ok: z.boolean(),
   error: z.string().nullable(),
 });
-type PinResult = z.infer<typeof pinResultShape>;
+type Result = z.infer<typeof resultShape>;
 
-// ---------- admin (全体管理) ----------
-//
-// The admin password is stored exactly like owner PINs (salted PBKDF2 in
-// the `pbkdf2$<iterations>$<salt>$<hash>` format, constant-time compare
-// via verifyPin), just with more iterations. Plaintext is never stored
-// and there is no known default password: while unset, only the first
-// person to open /admin can set it (setupAdminPassword refuses once set).
+async function monthOverrides(ctx: Ctx, shopId: number, yearMonth: string) {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.dayOverrides)
+    .where(eq(schema.dayOverrides.shopId, shopId))
+    .orderBy(asc(schema.dayOverrides.date));
+  return rows
+    .filter((o) => o.date.startsWith(yearMonth))
+    .map((o) => ({ date: o.date, kind: o.kind, note: o.note, hours: o.hours }));
+}
+
+// ---------- admin helpers ----------
 
 const ADMIN_PASSWORD_ITERATIONS = 120000;
-
-// Slugs that can never be assigned to a shop: "owner" is the per-shop
-// owner path segment, "admin" is the whole-app admin page path.
-const RESERVED_SLUGS = new Set(["owner", "admin"]);
 
 type AdminRow = typeof schema.adminSettings.$inferSelect;
 
@@ -248,16 +352,14 @@ async function getAdminRow(ctx: Ctx): Promise<AdminRow> {
     .where(eq(schema.adminSettings.id, 1));
   const row = rows[0];
   if (row) return row;
-  await db
-    .insert(schema.adminSettings)
-    .values({ id: 1, passwordHash: "", isSet: 0 });
+  await db.insert(schema.adminSettings).values({ id: 1, passwordHash: "", isSet: 0 });
   return { id: 1, passwordHash: "", isSet: 0 };
 }
 
 async function verifyAdmin(ctx: Ctx, password: string): Promise<boolean> {
   const row = await getAdminRow(ctx);
   if (row.isSet === 0 || !row.passwordHash) return false;
-  return verifyPin(row.passwordHash, password);
+  return verifySecret(row.passwordHash, password);
 }
 
 async function requireAdmin(ctx: Ctx, password: string): Promise<void> {
@@ -265,382 +367,230 @@ async function requireAdmin(ctx: Ctx, password: string): Promise<void> {
   if (!ok) throw new Error("管理者認証が必要です。パスワードが違います");
 }
 
-const menuShape = z.object({
-  id: z.number(),
-  shopId: z.number(),
-  name: z.string(),
-  price: z.number().nullable(),
-  minutes: z.number(),
-  sortOrder: z.number(),
-});
+// ---------- login throttling ----------
 
-const bookingShape = z.object({
-  id: z.number(),
-  shopId: z.number(),
-  menuId: z.number().nullable(),
-  menuName: z.string(),
-  customerName: z.string(),
-  phone: z.string(),
-  date: z.string(),
-  startTime: z.string(),
-  minutes: z.number(),
-  status: z.string(),
-  createdAt: z.string(),
-});
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_LOCK_MS = 10 * 60 * 1000; // 10 minutes
 
-// 公開用（暗証番号なしで返す）予約形: 空き状況の計算に必要な項目だけ。
-// 氏名・電話番号は含めない。
-const publicBookingShape = z.object({
-  id: z.number(),
-  shopId: z.number(),
-  menuId: z.number().nullable(),
-  menuName: z.string(),
-  date: z.string(),
-  startTime: z.string(),
-  minutes: z.number(),
-  status: z.string(),
-  createdAt: z.string(),
-});
-
-type BookingRow = typeof schema.bookings.$inferSelect;
-
-function toFullBooking(b: BookingRow): z.infer<typeof bookingShape> {
-  return {
-    id: b.id,
-    shopId: b.shopId,
-    menuId: b.menuId,
-    menuName: b.menuName,
-    customerName: b.customerName,
-    phone: b.phone,
-    date: b.date,
-    startTime: b.startTime,
-    minutes: b.minutes,
-    status: b.status,
-    createdAt: b.createdAt.toISOString(),
-  };
-}
-
-const okShape = z.object({ ok: z.literal(true) });
-type Ok = z.infer<typeof okShape>;
-
-const bookingResultShape = z.object({
-  ok: z.boolean(),
-  error: z.string().nullable(),
-  bookingId: z.number().nullable(),
-});
-type BookingResult = z.infer<typeof bookingResultShape>;
+// ---------- actions ----------
 
 export const Actions = {
-  getState: defineAction({
-    request: z.object({}),
+  // 公開カレンダー: /<slug> 用。認証不要。秘匿列は一切含めない。
+  getCalendar: defineAction({
+    request: z.object({
+      slug: z.string().min(1).max(30),
+      yearMonth: z.string().regex(/^\d{4}-\d{2}$/),
+    }),
     response: z.object({
-      shops: z.array(shopShape),
-      menus: z.array(menuShape),
-      overrides: z.array(
-        z.object({
-          id: z.number(),
-          shopId: z.number(),
-          date: z.string(),
-          kind: z.string(),
-        }),
-      ),
-      bookings: z.array(publicBookingShape),
+      found: z.boolean(),
+      shop: publicShopShape.nullable(),
+      overrides: z.array(overrideShape),
       today: z.string(),
     }),
-    async handler(ctx) {
-      const db = ctx.db<typeof schema>();
-      await seedIfEmpty(ctx);
-      const shopRows = await db.select().from(schema.shops).orderBy(asc(schema.shops.id));
-      const menuRows = await db.select().from(schema.menus).orderBy(asc(schema.menus.sortOrder), asc(schema.menus.id));
-      const overrideRows = await db.select().from(schema.dayOverrides);
-      const bookingRows = await db.select().from(schema.bookings).orderBy(asc(schema.bookings.date), asc(schema.bookings.startTime));
+    async handler(ctx, args) {
+      const shop = await findShopBySlug(ctx, args.slug);
+      if (!shop) {
+        return { found: false, shop: null, overrides: [], today: todayJST() };
+      }
       return {
-        shops: shopRows.map((s) => ({
-          id: s.id,
-          slug: s.slug,
-          name: s.name,
-          address: s.address,
-          phone: s.phone,
-          openTime: s.openTime,
-          closeTime: s.closeTime,
-          slotMinutes: s.slotMinutes,
-          chairs: s.chairs,
-          closedWeekdays: parseWeekdays(s.closedWeekdays),
-          nthClosures: parseNth(s.nthClosures),
-          pinNeedsSetup: s.pinChanged === 0,
-        })),
-        menus: menuRows.map((m) => ({
-          id: m.id,
-          shopId: m.shopId,
-          name: m.name,
-          price: m.price,
-          minutes: m.minutes,
-          sortOrder: m.sortOrder,
-        })),
-        overrides: overrideRows.map((o) => ({
-          id: o.id,
-          shopId: o.shopId,
-          date: o.date,
-          kind: o.kind,
-        })),
-        bookings: bookingRows.map((b) => ({
-          id: b.id,
-          shopId: b.shopId,
-          menuId: b.menuId,
-          menuName: b.menuName,
-          date: b.date,
-          startTime: b.startTime,
-          minutes: b.minutes,
-          status: b.status,
-          createdAt: b.createdAt.toISOString(),
-        })),
+        found: true,
+        shop: toPublicShop(shop),
+        overrides: await monthOverrides(ctx, shop.id, args.yearMonth),
         today: todayJST(),
       };
     },
   }),
 
-  // 店主専用: 暗証番号認証後に、その店舗の予約（氏名・電話番号つき）を返す
-  getOwnerBookings: defineAction({
+  // 新規登録: ID（slug）+ パスワードでカレンダーを作成し、そのまま
+  // ownerセッションを発行する。編集リンクも同時に発行し、平文は
+  // この応答で一度だけ返す（DBにはハッシュのみ）。
+  signup: defineAction({
     request: z.object({
-      shopId: z.number().int(),
-      ownerPin: z.string().regex(/^\d{4}$/),
+      slug: slugSchema,
+      name: z.string().min(1).max(50),
+      password: z.string().min(8).max(128),
     }),
-    response: z.object({ bookings: z.array(bookingShape) }),
-    async handler(ctx, args): Promise<{ bookings: z.infer<typeof bookingShape>[] }> {
-      await requireOwnerPin(ctx, args.shopId, args.ownerPin);
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.bookings)
-        .where(eq(schema.bookings.shopId, args.shopId))
-        .orderBy(asc(schema.bookings.date), asc(schema.bookings.startTime));
-      return { bookings: rows.map(toFullBooking) };
-    },
-  }),
-
-  // お客さん専用: 予約時の電話番号で、指定した店舗における自分の今後の
-  // 予約だけを返す（店舗専用ページから使うため店舗スコープにする）
-  lookupMyBookings: defineAction({
-    request: z.object({
-      shopId: z.number().int(),
-      phone: z.string().min(8).max(20),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      slug: z.string().nullable(),
+      editToken: z.string().nullable(),
     }),
-    response: z.object({ bookings: z.array(bookingShape) }),
-    async handler(ctx, args): Promise<{ bookings: z.infer<typeof bookingShape>[] }> {
+    async handler(ctx, args) {
+      const fail = (error: string) => ({ ok: false, error, slug: null, editToken: null });
+      const reserved = slugError(args.slug);
+      if (reserved) return fail(reserved);
       const db = ctx.db<typeof schema>();
-      const target = digits(args.phone);
-      const today = todayJST();
-      const rows = await db
-        .select()
-        .from(schema.bookings)
-        .where(eq(schema.bookings.shopId, args.shopId))
-        .orderBy(asc(schema.bookings.date), asc(schema.bookings.startTime));
-      const mine = rows.filter(
-        (b) => digits(b.phone) === target && b.status === "booked" && b.date >= today,
-      );
-      return { bookings: mine.map(toFullBooking) };
-    },
-  }),
-
-  createBooking: defineAction({
-    request: z.object({
-      shopId: z.number().int(),
-      menuId: z.number().int(),
-      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-      startTime: z.string().regex(/^\d{2}:\d{2}$/),
-      customerName: z.string().min(1).max(50),
-      phone: z.string().min(8).max(20),
-    }),
-    response: bookingResultShape,
-    async handler(ctx, args): Promise<BookingResult> {
-      const db = ctx.db<typeof schema>();
-      const fail = (error: string): BookingResult => ({ ok: false, error, bookingId: null });
-
-      if (args.date < todayJST()) return fail("過去の日付には予約できません");
-      const shopRows = await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId));
-      const shop = shopRows[0];
-      if (!shop) return fail("お店が見つかりません");
-      const menuRows = await db.select().from(schema.menus).where(eq(schema.menus.id, args.menuId));
-      const menu = menuRows[0];
-      if (!menu || menu.shopId !== shop.id) return fail("メニューが見つかりません");
-
-      const overrides = await db.select().from(schema.dayOverrides).where(eq(schema.dayOverrides.shopId, shop.id));
-      if (!isOpenDay(shop, overrides, args.date)) return fail("その日は休業日です");
-
-      const start = toMin(args.startTime);
-      const end = start + menu.minutes;
-      if (start < toMin(shop.openTime) || end > toMin(shop.closeTime)) {
-        return fail("営業時間内に終わる時間を選んでください");
-      }
-
-      const dayBookings = await db
-        .select()
-        .from(schema.bookings)
-        .where(eq(schema.bookings.shopId, shop.id));
-      const active = dayBookings.filter((b) => b.date === args.date && b.status === "booked");
-      const points = new Set<number>([start]);
-      for (const b of active) {
-        const bs = toMin(b.startTime);
-        if (bs > start && bs < end) points.add(bs);
-      }
-      for (const p of points) {
-        const covering = active.filter((b) => {
-          const bs = toMin(b.startTime);
-          const be = bs + b.minutes;
-          return bs <= p && p < be;
-        }).length;
-        if (covering >= shop.chairs) {
-          return fail("その時間は満席です。別の時間を選んでください");
-        }
-      }
-
+      const existing = await findShopBySlug(ctx, args.slug);
+      if (existing) return fail(`ID「${args.slug}」はすでに使われています`);
+      const editToken = crypto.randomUUID();
       const inserted = await db
-        .insert(schema.bookings)
+        .insert(schema.shops)
         .values({
-          shopId: shop.id,
-          menuId: menu.id,
-          menuName: menu.name,
-          customerName: args.customerName,
-          phone: args.phone,
-          date: args.date,
-          startTime: args.startTime,
-          minutes: menu.minutes,
+          slug: args.slug,
+          name: args.name.trim(),
+          passwordHash: await hashSecret(args.password),
+          editTokenHash: await sha256Hex(editToken),
+          openTime: "09:00",
+          closeTime: "19:00",
+          closedWeekdays: JSON.stringify([1]),
+          nthClosures: JSON.stringify([
+            { nth: 2, weekday: 2 },
+            { nth: 3, weekday: 2 },
+          ]),
+          updatedAt: Date.now(),
         })
-        .returning({ id: schema.bookings.id });
+        .returning({ id: schema.shops.id });
       const row = inserted[0];
-      if (!row) return fail("予約に失敗しました");
+      if (!row) return fail("登録に失敗しました");
+      await createSession(ctx, row.id, "owner");
       ctx.invalidateQueries();
-      return { ok: true, error: null, bookingId: row.id };
+      return { ok: true, error: null, slug: args.slug, editToken };
     },
   }),
 
-  cancelBooking: defineAction({
+  // ログイン: ID + パスワード。失敗が続くとアカウント単位で一定時間
+  // ロックする（失敗回数とロック期限はDBに記録）。
+  login: defineAction({
     request: z.object({
-      id: z.number().int(),
-      phone: z.string().max(20).optional(),
-      ownerPin: z.string().regex(/^\d{4}$/).optional(),
+      slug: slugSchema,
+      password: z.string().min(1).max(128),
     }),
-    response: bookingResultShape,
-    async handler(ctx, args): Promise<BookingResult> {
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      slug: z.string().nullable(),
+    }),
+    async handler(ctx, args) {
+      const fail = (error: string) => ({ ok: false, error, slug: null });
       const db = ctx.db<typeof schema>();
-      const rows = await db.select().from(schema.bookings).where(eq(schema.bookings.id, args.id));
-      const b = rows[0];
-      if (!b) return { ok: false, error: "予約が見つかりません", bookingId: null };
-      if (args.phone !== undefined) {
-        // お客さん側: 予約時の電話番号で照合
-        if (digits(args.phone) !== digits(b.phone)) {
-          return { ok: false, error: "電話番号が予約と一致しません", bookingId: null };
-        }
-      } else if (args.ownerPin !== undefined) {
-        // 店主側: その店舗の暗証番号で照合（初期の仮暗証番号のままでは不可）
-        const shopRows = await db.select().from(schema.shops).where(eq(schema.shops.id, b.shopId));
-        const shop = shopRows[0];
-        if (!shop || !(await verifyPin(shop.ownerPin, args.ownerPin))) {
-          return { ok: false, error: "暗証番号が違います", bookingId: null };
-        }
-        if (shop.pinChanged === 0) {
-          return { ok: false, error: "暗証番号がまだ設定されていません", bookingId: null };
-        }
-      } else {
-        return { ok: false, error: "認証が必要です", bookingId: null };
+      const shop = await findShopBySlug(ctx, args.slug);
+      // IDの有無やパスワード未設定を区別せず、同じ文言で返す
+      if (!shop || !shop.passwordHash) return fail("IDまたはパスワードが違います");
+      const now = Date.now();
+      if (shop.loginLockedUntil > now) {
+        return fail("ログイン失敗が続いたため、しばらく時間をおいてからお試しください");
       }
-      await db
-        .update(schema.bookings)
-        .set({ status: "cancelled" })
-        .where(eq(schema.bookings.id, args.id));
-      ctx.invalidateQueries();
-      return { ok: true, error: null, bookingId: args.id };
-    },
-  }),
-
-  verifyOwnerPin: defineAction({
-    request: z.object({
-      shopId: z.number().int(),
-      pin: z.string().regex(/^\d{4}$/),
-    }),
-    response: z.object({ ok: z.boolean() }),
-    async handler(ctx, args): Promise<{ ok: boolean }> {
-      const db = ctx.db<typeof schema>();
-      const rows = await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId));
-      const shop = rows[0];
-      return { ok: shop !== undefined && (await verifyPin(shop.ownerPin, args.pin)) };
-    },
-  }),
-
-  // 初回設定: 暗証番号が未設定の店舗にだけ、店主がその場で決めた番号を設定できる。
-  // 既知の初期番号は存在しない。設定済みの店舗では使えない。
-  setupOwnerPin: defineAction({
-    request: z.object({
-      shopId: z.number().int(),
-      newPin: z.string().regex(/^\d{4}$/),
-    }),
-    response: pinResultShape,
-    async handler(ctx, args): Promise<PinResult> {
-      const db = ctx.db<typeof schema>();
-      const rows = await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId));
-      const shop = rows[0];
-      if (!shop) return { ok: false, error: "お店が見つかりません" };
-      if (shop.pinChanged !== 0 || shop.ownerPin !== "") {
-        return { ok: false, error: "すでに暗証番号が設定されています" };
+      const ok = await verifySecret(shop.passwordHash, args.password);
+      if (!ok) {
+        const count = shop.failedLoginCount + 1;
+        if (count >= LOGIN_MAX_FAILURES) {
+          await db
+            .update(schema.shops)
+            .set({ failedLoginCount: 0, loginLockedUntil: now + LOGIN_LOCK_MS })
+            .where(eq(schema.shops.id, shop.id));
+          return fail("ログイン失敗が続いたため、しばらく時間をおいてからお試しください");
+        }
+        await db
+          .update(schema.shops)
+          .set({ failedLoginCount: count })
+          .where(eq(schema.shops.id, shop.id));
+        return fail("IDまたはパスワードが違います");
       }
       await db
         .update(schema.shops)
-        .set({ ownerPin: await hashPin(args.newPin), pinChanged: 1 })
-        .where(eq(schema.shops.id, args.shopId));
+        .set({ failedLoginCount: 0, loginLockedUntil: 0 })
+        .where(eq(schema.shops.id, shop.id));
+      await createSession(ctx, shop.id, "owner");
+      ctx.invalidateQueries();
+      return { ok: true, error: null, slug: shop.slug };
+    },
+  }),
+
+  logout: defineAction({
+    request: z.object({}),
+    response: resultShape,
+    async handler(ctx): Promise<Result> {
+      if (ctx.sessionToken) {
+        const db = ctx.db<typeof schema>();
+        const tokenHash = await sha256Hex(ctx.sessionToken);
+        await db.delete(schema.sessions).where(eq(schema.sessions.tokenHash, tokenHash));
+      }
+      queueSessionCookie(ctx, "", 0);
       ctx.invalidateQueries();
       return { ok: true, error: null };
     },
   }),
 
-  changeOwnerPin: defineAction({
-    request: z.object({
-      shopId: z.number().int(),
-      currentPin: z.string().regex(/^\d{4}$/),
-      newPin: z.string().regex(/^\d{4}$/),
+  getSession: defineAction({
+    request: z.object({}),
+    response: z.object({
+      loggedIn: z.boolean(),
+      slug: z.string().nullable(),
+      scope: z.string().nullable(),
     }),
-    response: pinResultShape,
-    async handler(ctx, args): Promise<PinResult> {
-      const db = ctx.db<typeof schema>();
-      const rows = await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId));
-      const shop = rows[0];
-      if (!shop) return { ok: false, error: "お店が見つかりません" };
-      if (shop.pinChanged === 0 || shop.ownerPin === "") {
-        return {
-          ok: false,
-          error: "暗証番号がまだ設定されていません。店主画面の初回設定から設定してください",
-        };
+    async handler(ctx) {
+      const info = await resolveSession(ctx);
+      if (!info) return { loggedIn: false, slug: null, scope: null };
+      return { loggedIn: true, slug: info.shop.slug, scope: info.scope };
+    },
+  }),
+
+  // 秘密編集リンク /<slug>/<UUID> の照合。合えば、そのカレンダー限定の
+  // 編集セッション（scope=editlink）を発行する。
+  redeemEditLink: defineAction({
+    request: z.object({
+      slug: z.string().min(1).max(30),
+      token: z.string().min(1).max(100),
+    }),
+    response: resultShape,
+    async handler(ctx, args): Promise<Result> {
+      const shop = await findShopBySlug(ctx, args.slug);
+      if (!shop || !shop.editTokenHash) {
+        return { ok: false, error: "この編集リンクは無効です" };
       }
-      if (!(await verifyPin(shop.ownerPin, args.currentPin))) {
-        return { ok: false, error: "今の暗証番号が違います" };
+      const tokenHash = await sha256Hex(args.token);
+      if (!hashesEqual(tokenHash, shop.editTokenHash)) {
+        return { ok: false, error: "この編集リンクは無効です" };
       }
-      if (args.newPin === args.currentPin) {
-        return { ok: false, error: "新しい暗証番号が今と同じです" };
-      }
-      await db
-        .update(schema.shops)
-        .set({ ownerPin: await hashPin(args.newPin), pinChanged: 1 })
-        .where(eq(schema.shops.id, args.shopId));
+      await createSession(ctx, shop.id, "editlink");
       ctx.invalidateQueries();
       return { ok: true, error: null };
     },
   }),
 
-  updateShop: defineAction({
+  // 編集画面用: 自分のカレンダーの全情報（秘匿列は含めず、設定済みか
+  // どうかのフラグだけを返す）
+  getEditState: defineAction({
     request: z.object({
-      id: z.number().int(),
-      ownerPin: z.string().regex(/^\d{4}$/),
-      slug: z
-        .string()
-        .min(2)
-        .max(32)
-        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+      slug: z.string().min(1).max(30),
+      yearMonth: z.string().regex(/^\d{4}-\d{2}$/),
+    }),
+    response: z.object({
+      shop: publicShopShape.extend({
+        address: z.string(),
+        hasPassword: z.boolean(),
+        editTokenSet: z.boolean(),
+      }),
+      overrides: z.array(overrideShape),
+      scope: z.string(),
+      today: z.string(),
+    }),
+    async handler(ctx, args) {
+      const info = await requireShopSession(ctx, args.slug);
+      const s = info.shop;
+      return {
+        shop: {
+          ...toPublicShop(s),
+          hasPassword: s.passwordHash !== "",
+          editTokenSet: s.editTokenHash !== "",
+        },
+        overrides: await monthOverrides(ctx, s.id, args.yearMonth),
+        scope: info.scope,
+        today: todayJST(),
+      };
+    },
+  }),
+
+  // プロフィール・一言・テーマ・営業時間・定休日ルールの更新
+  updateProfile: defineAction({
+    request: z.object({
+      slug: z.string().min(1).max(30),
       name: z.string().min(1).max(50),
       address: z.string().max(200),
       phone: z.string().max(20),
       openTime: z.string().regex(/^\d{2}:\d{2}$/),
       closeTime: z.string().regex(/^\d{2}:\d{2}$/),
-      slotMinutes: z.number().int().min(10).max(120),
-      chairs: z.number().int().min(1).max(10),
       closedWeekdays: z.array(z.number().int().min(0).max(6)),
       nthClosures: z.array(
         z.object({
@@ -648,55 +598,56 @@ export const Actions = {
           weekday: z.number().int().min(0).max(6),
         }),
       ),
+      message: z.string().max(500),
+      theme: z.enum(THEMES),
+      instagramUrl: z.string().max(300),
     }),
-    response: pinResultShape,
-    async handler(ctx, args): Promise<PinResult> {
-      await requireOwnerPin(ctx, args.id, args.ownerPin);
-      // 「owner」「admin」はパスの予約語なのでスラッグには使えない
-      if (RESERVED_SLUGS.has(args.slug)) {
-        return { ok: false, error: `「${args.slug}」はURL用スラッグに使えません` };
+    response: resultShape,
+    async handler(ctx, args): Promise<Result> {
+      const info = await requireShopSession(ctx, args.slug);
+      const instagramUrl = args.instagramUrl.trim();
+      if (instagramUrl !== "" && !instagramUrl.startsWith("https://")) {
+        return { ok: false, error: "InstagramのURLは https:// から始まる形で入力してください" };
       }
       const db = ctx.db<typeof schema>();
-      const all = await db.select().from(schema.shops);
-      const conflict = all.find((s) => s.id !== args.id && s.slug === args.slug);
-      if (conflict) {
-        return {
-          ok: false,
-          error: `スラッグ「${args.slug}」は他のお店（${conflict.name}）で使われています`,
-        };
-      }
       await db
         .update(schema.shops)
         .set({
-          slug: args.slug,
-          name: args.name,
-          address: args.address,
-          phone: args.phone,
+          name: args.name.trim(),
+          address: args.address.trim(),
+          phone: args.phone.trim(),
           openTime: args.openTime,
           closeTime: args.closeTime,
-          slotMinutes: args.slotMinutes,
-          chairs: args.chairs,
           closedWeekdays: JSON.stringify(args.closedWeekdays),
           nthClosures: JSON.stringify(args.nthClosures),
+          message: args.message,
+          theme: args.theme,
+          instagramUrl,
+          updatedAt: Date.now(),
         })
-        .where(eq(schema.shops.id, args.id));
+        .where(eq(schema.shops.id, info.shop.id));
       ctx.invalidateQueries();
       return { ok: true, error: null };
     },
   }),
 
+  // 日ごとの営業/休業の切替とメモ・時間上書き。kind=clear で上書き解除
   setDayOverride: defineAction({
     request: z.object({
-      shopId: z.number().int(),
-      ownerPin: z.string().regex(/^\d{4}$/),
+      slug: z.string().min(1).max(30),
       date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
       kind: z.enum(["closed", "open", "clear"]),
+      note: z.string().max(100),
+      hours: z.string().regex(/^(\d{2}:\d{2}-\d{2}:\d{2})?$/),
     }),
-    response: okShape,
-    async handler(ctx, args): Promise<Ok> {
-      await requireOwnerPin(ctx, args.shopId, args.ownerPin);
+    response: resultShape,
+    async handler(ctx, args): Promise<Result> {
+      const info = await requireShopSession(ctx, args.slug);
       const db = ctx.db<typeof schema>();
-      const rows = await db.select().from(schema.dayOverrides).where(eq(schema.dayOverrides.shopId, args.shopId));
+      const rows = await db
+        .select()
+        .from(schema.dayOverrides)
+        .where(eq(schema.dayOverrides.shopId, info.shop.id));
       const existing = rows.find((o) => o.date === args.date);
       if (args.kind === "clear") {
         if (existing) {
@@ -705,100 +656,111 @@ export const Actions = {
       } else if (existing) {
         await db
           .update(schema.dayOverrides)
-          .set({ kind: args.kind })
+          .set({ kind: args.kind, note: args.note, hours: args.hours })
           .where(eq(schema.dayOverrides.id, existing.id));
       } else {
         await db.insert(schema.dayOverrides).values({
-          shopId: args.shopId,
+          shopId: info.shop.id,
           date: args.date,
           kind: args.kind,
+          note: args.note,
+          hours: args.hours,
         });
       }
+      await touchUpdatedAt(ctx, info.shop.id);
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: null };
     },
   }),
 
-  upsertMenu: defineAction({
+  // パスワード変更: 現在のパスワードの照合が必須（編集リンクだけでは
+  // 変更できない）。変更したら他のセッションは全て破棄する
+  changePassword: defineAction({
     request: z.object({
-      id: z.number().int().nullable(),
-      shopId: z.number().int(),
-      ownerPin: z.string().regex(/^\d{4}$/),
-      name: z.string().min(1).max(50),
-      price: z.number().int().min(0).max(1000000).nullable(),
-      minutes: z.number().int().min(10).max(600),
+      slug: z.string().min(1).max(30),
+      currentPassword: z.string().min(1).max(128),
+      newPassword: z.string().min(8).max(128),
     }),
-    response: okShape,
-    async handler(ctx, args): Promise<Ok> {
-      await requireOwnerPin(ctx, args.shopId, args.ownerPin);
+    response: resultShape,
+    async handler(ctx, args): Promise<Result> {
+      const info = await requireShopSession(ctx, args.slug);
+      const shop = info.shop;
+      if (!shop.passwordHash) {
+        return { ok: false, error: "パスワードが設定されていません" };
+      }
+      if (!(await verifySecret(shop.passwordHash, args.currentPassword))) {
+        return { ok: false, error: "今のパスワードが違います" };
+      }
+      if (args.newPassword === args.currentPassword) {
+        return { ok: false, error: "新しいパスワードが今と同じです" };
+      }
       const db = ctx.db<typeof schema>();
-      if (args.id !== null) {
-        const menuRows = await db.select().from(schema.menus).where(eq(schema.menus.id, args.id));
-        const menu = menuRows[0];
-        if (!menu || menu.shopId !== args.shopId) throw new Error("メニューが見つかりません");
-        await db
-          .update(schema.menus)
-          .set({ name: args.name, price: args.price, minutes: args.minutes })
-          .where(eq(schema.menus.id, args.id));
-      } else {
-        const rows = await db.select().from(schema.menus).where(eq(schema.menus.shopId, args.shopId));
-        const maxOrder = rows.reduce((acc, m) => Math.max(acc, m.sortOrder), -1);
-        await db.insert(schema.menus).values({
-          shopId: args.shopId,
-          name: args.name,
-          price: args.price,
-          minutes: args.minutes,
-          sortOrder: maxOrder + 1,
-        });
+      await db
+        .update(schema.shops)
+        .set({
+          passwordHash: await hashSecret(args.newPassword),
+          failedLoginCount: 0,
+          loginLockedUntil: 0,
+        })
+        .where(eq(schema.shops.id, shop.id));
+      // 他のセッションを破棄（現在のセッションだけ残す）
+      const allSessions = await db
+        .select()
+        .from(schema.sessions)
+        .where(eq(schema.sessions.shopId, shop.id));
+      const currentHash = ctx.sessionToken ? await sha256Hex(ctx.sessionToken) : "";
+      for (const s of allSessions) {
+        if (s.tokenHash !== currentHash) {
+          await db.delete(schema.sessions).where(eq(schema.sessions.id, s.id));
+        }
       }
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: null };
     },
   }),
 
-  deleteMenu: defineAction({
-    request: z.object({
-      id: z.number().int(),
-      shopId: z.number().int(),
-      ownerPin: z.string().regex(/^\d{4}$/),
+  // 編集リンクの再発行: 新しいUUIDを発行し、旧リンクは無効化する。
+  // 平文はこの応答で一度だけ返す
+  reissueEditToken: defineAction({
+    request: z.object({ slug: z.string().min(1).max(30) }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      editToken: z.string().nullable(),
     }),
-    response: okShape,
-    async handler(ctx, args): Promise<Ok> {
-      await requireOwnerPin(ctx, args.shopId, args.ownerPin);
+    async handler(ctx, args) {
+      const info = await requireShopSession(ctx, args.slug);
+      const editToken = crypto.randomUUID();
       const db = ctx.db<typeof schema>();
-      const menuRows = await db.select().from(schema.menus).where(eq(schema.menus.id, args.id));
-      const menu = menuRows[0];
-      if (!menu || menu.shopId !== args.shopId) throw new Error("メニューが見つかりません");
-      await db.delete(schema.menus).where(eq(schema.menus.id, args.id));
+      await db
+        .update(schema.shops)
+        .set({ editTokenHash: await sha256Hex(editToken) })
+        .where(eq(schema.shops.id, info.shop.id));
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, error: null, editToken };
     },
   }),
 
-  // ---------- admin (全体管理) ----------
-  // /admin ページ専用。管理者パスワードは店主暗証番号と同じ
-  // ソルト付きハッシュ形式で保存し、既知の初期パスワードは置かない。
-  // 未設定の間だけ、最初に開いた管理者本人が設定できる。
+  // ---------- admin (全体管理・運営用) ----------
+  // /admin ページ専用。管理者パスワードは既知の初期値を置かず、未設定の
+  // 間だけ最初に開いた管理者本人が設定できる。機能はアカウント一覧と
+  // アカウント削除に絞る（店舗追加はセルフ登録に置き換えた）。
 
-  // 管理者パスワードが未設定かどうかだけを返す（パスワード自体や
-  // 店舗情報は一切返さない）
   getAdminStatus: defineAction({
     request: z.object({}),
     response: z.object({ needsSetup: z.boolean() }),
     async handler(ctx): Promise<{ needsSetup: boolean }> {
-      await seedIfEmpty(ctx);
       const row = await getAdminRow(ctx);
       return { needsSetup: row.isSet === 0 };
     },
   }),
 
-  // 初回設定: 管理者パスワードが未設定の間だけ設定できる
   setupAdminPassword: defineAction({
     request: z.object({
       newPassword: z.string().min(6).max(128),
     }),
-    response: pinResultShape,
-    async handler(ctx, args): Promise<PinResult> {
+    response: resultShape,
+    async handler(ctx, args): Promise<Result> {
       const row = await getAdminRow(ctx);
       if (row.isSet !== 0) {
         return { ok: false, error: "すでに管理者パスワードが設定されています" };
@@ -807,7 +769,7 @@ export const Actions = {
       await db
         .update(schema.adminSettings)
         .set({
-          passwordHash: await hashPin(args.newPassword, ADMIN_PASSWORD_ITERATIONS),
+          passwordHash: await hashSecret(args.newPassword, ADMIN_PASSWORD_ITERATIONS),
           isSet: 1,
         })
         .where(eq(schema.adminSettings.id, 1));
@@ -825,14 +787,13 @@ export const Actions = {
     },
   }),
 
-  // 変更には現在のパスワードの照合が必須
   changeAdminPassword: defineAction({
     request: z.object({
       currentPassword: z.string().min(1).max(128),
       newPassword: z.string().min(6).max(128),
     }),
-    response: pinResultShape,
-    async handler(ctx, args): Promise<PinResult> {
+    response: resultShape,
+    async handler(ctx, args): Promise<Result> {
       const row = await getAdminRow(ctx);
       if (row.isSet === 0) {
         return { ok: false, error: "管理者パスワードがまだ設定されていません" };
@@ -846,7 +807,7 @@ export const Actions = {
       await db
         .update(schema.adminSettings)
         .set({
-          passwordHash: await hashPin(args.newPassword, ADMIN_PASSWORD_ITERATIONS),
+          passwordHash: await hashSecret(args.newPassword, ADMIN_PASSWORD_ITERATIONS),
           isSet: 1,
         })
         .where(eq(schema.adminSettings.id, 1));
@@ -855,143 +816,57 @@ export const Actions = {
     },
   }),
 
-  // 管理者専用: 全店舗の一覧（スラッグ・店主PIN設定状態つき）。
-  // 未認証では何も返さない（requireAdmin が例外を投げる）
-  adminListShops: defineAction({
+  // 管理者専用: 全アカウントの一覧（秘匿列は含めない）
+  adminListAccounts: defineAction({
     request: z.object({ adminPassword: z.string().min(1).max(128) }),
-    response: z.object({ shops: z.array(shopShape) }),
-    async handler(ctx, args): Promise<{ shops: z.infer<typeof shopShape>[] }> {
+    response: z.object({
+      accounts: z.array(
+        z.object({
+          id: z.number(),
+          slug: z.string(),
+          name: z.string(),
+          hasPassword: z.boolean(),
+          editTokenSet: z.boolean(),
+          updatedAt: z.string().nullable(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
       await requireAdmin(ctx, args.adminPassword);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.shops).orderBy(asc(schema.shops.id));
       return {
-        shops: rows.map((s) => ({
+        accounts: rows.map((s) => ({
           id: s.id,
           slug: s.slug,
           name: s.name,
-          address: s.address,
-          phone: s.phone,
-          openTime: s.openTime,
-          closeTime: s.closeTime,
-          slotMinutes: s.slotMinutes,
-          chairs: s.chairs,
-          closedWeekdays: parseWeekdays(s.closedWeekdays),
-          nthClosures: parseNth(s.nthClosures),
-          pinNeedsSetup: s.pinChanged === 0,
+          hasPassword: s.passwordHash !== "",
+          editTokenSet: s.editTokenHash !== "",
+          updatedAt: s.updatedAt > 0 ? new Date(s.updatedAt).toISOString() : null,
         })),
       };
     },
   }),
 
-  // 管理者専用: 店舗の追加。初期値は営業時間 09:00–19:00・枠30分・
-  // 椅子1台・月曜＋第2/第3火曜定休・デフォルトメニュー6種で、
-  // 店主暗証番号は未設定（店主本人が後で初回設定する）
-  adminCreateShop: defineAction({
-    request: z.object({
-      adminPassword: z.string().min(1).max(128),
-      name: z.string().min(1).max(50),
-      slug: z.string().min(2).max(32).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
-      address: z.string().max(200),
-      phone: z.string().max(20),
-    }),
-    response: z.object({
-      ok: z.boolean(),
-      error: z.string().nullable(),
-      shopId: z.number().nullable(),
-    }),
-    async handler(
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; error: string | null; shopId: number | null }> {
-      try {
-        await requireAdmin(ctx, args.adminPassword);
-      } catch {
-        return { ok: false, error: "管理者認証が必要です。パスワードが違います", shopId: null };
-      }
-      if (RESERVED_SLUGS.has(args.slug)) {
-        return { ok: false, error: `「${args.slug}」はスラッグに使えません`, shopId: null };
-      }
-      const db = ctx.db<typeof schema>();
-      const all = await db.select().from(schema.shops);
-      const conflict = all.find((s) => s.slug === args.slug);
-      if (conflict) {
-        return {
-          ok: false,
-          error: `スラッグ「${args.slug}」は他のお店（${conflict.name}）で使われています`,
-          shopId: null,
-        };
-      }
-      const inserted = await db
-        .insert(schema.shops)
-        .values({
-          name: args.name.trim(),
-          slug: args.slug.trim(),
-          address: args.address.trim(),
-          phone: args.phone.trim(),
-          ownerPin: "",
-          pinChanged: 0,
-          openTime: "09:00",
-          closeTime: "19:00",
-          slotMinutes: 30,
-          chairs: 1,
-          closedWeekdays: JSON.stringify([1]),
-          nthClosures: JSON.stringify([
-            { nth: 2, weekday: 2 },
-            { nth: 3, weekday: 2 },
-          ]),
-        })
-        .returning({ id: schema.shops.id });
-      const shop = inserted[0];
-      if (!shop) return { ok: false, error: "店舗の作成に失敗しました", shopId: null };
-      for (let i = 0; i < DEFAULT_MENUS.length; i++) {
-        const m = DEFAULT_MENUS[i];
-        if (!m) continue;
-        await db.insert(schema.menus).values({
-          shopId: shop.id,
-          name: m.name,
-          price: m.price,
-          minutes: m.minutes,
-          sortOrder: i,
-        });
-      }
-      ctx.invalidateQueries();
-      return { ok: true, error: null, shopId: shop.id };
-    },
-  }),
-
-  // 管理者専用: 既存店舗のスラッグ変更。重複と予約語はサーバー側でも拒否する
-  adminUpdateSlug: defineAction({
+  // 管理者専用: アカウントの削除（カレンダー・上書き・セッションを全て消す）
+  adminDeleteAccount: defineAction({
     request: z.object({
       adminPassword: z.string().min(1).max(128),
       shopId: z.number().int(),
-      slug: z.string().min(2).max(32).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
     }),
-    response: pinResultShape,
-    async handler(ctx, args): Promise<PinResult> {
+    response: resultShape,
+    async handler(ctx, args): Promise<Result> {
       try {
         await requireAdmin(ctx, args.adminPassword);
       } catch {
         return { ok: false, error: "管理者認証が必要です。パスワードが違います" };
       }
-      if (RESERVED_SLUGS.has(args.slug)) {
-        return { ok: false, error: `「${args.slug}」はスラッグに使えません` };
-      }
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId));
-      const shop = rows[0];
-      if (!shop) return { ok: false, error: "お店が見つかりません" };
-      const all = await db.select().from(schema.shops);
-      const conflict = all.find((s) => s.id !== args.shopId && s.slug === args.slug);
-      if (conflict) {
-        return {
-          ok: false,
-          error: `スラッグ「${args.slug}」は他のお店（${conflict.name}）で使われています`,
-        };
-      }
-      await db
-        .update(schema.shops)
-        .set({ slug: args.slug })
-        .where(eq(schema.shops.id, args.shopId));
+      if (!rows[0]) return { ok: false, error: "アカウントが見つかりません" };
+      await db.delete(schema.dayOverrides).where(eq(schema.dayOverrides.shopId, args.shopId));
+      await db.delete(schema.sessions).where(eq(schema.sessions.shopId, args.shopId));
+      await db.delete(schema.shops).where(eq(schema.shops.id, args.shopId));
       ctx.invalidateQueries();
       return { ok: true, error: null };
     },

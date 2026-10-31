@@ -1,6 +1,11 @@
 name = "barber-reservation"
 main = "server/worker.ts"
 compatibility_date = "2026-10-30"
+# Node.js compatibility is explicitly OFF: at this compatibility_date the
+# Node.js APIs would otherwise be enabled by default. The Worker uses
+# Web-standard APIs only (fetch / Request / Response / Web Crypto), so
+# nothing depends on Node.js behavior at runtime.
+compatibility_flags = ["no_nodejs_compat", "no_nodejs_compat_v2"]
 
 # Built client (bun run build:client) served as Workers Static Assets.
 [assets]

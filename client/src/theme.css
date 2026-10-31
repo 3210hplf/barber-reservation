@@ -12,31 +12,147 @@
   --text-xl: 22px;
   --text-xl--line-height: 30px;
   --text-2xl: 26px;
-  --text-2xl--line-height: 34px;
+  --text-2xl--line-height: 36px;
   --text-3xl: 32px;
-  --text-3xl--line-height: 40px;
+  --text-3xl--line-height: 42px;
   --text-4xl: 38px;
-  --text-4xl--line-height: 44px;
+  --text-4xl--line-height: 48px;
 }
 
 :root {
   color-scheme: light dark;
-  --bg: #faf7f2;
-  --surface: #fffdf9;
-  --surface-alt: #f1eadf;
+  --bg: #f6f3ec;
+  --surface: #fffdf8;
+  --surface-alt: #efe9dc;
   --text: #23272e;
   --dim: #5d6470;
   --border: #ddd3c2;
   --accent: #1f3350;
   --accent-text: #ffffff;
-  --red: #b3402f;
-  --green: #2e6b4f;
+  --accent-soft: #e6ebf2;
+  --closed: #b3402f;
+  --closed-bg: #f7e9e4;
+  --open: #2e7d4f;
   --radius: 14px;
   --space-surface: var(--surface);
   --space-surface-alt: var(--surface-alt);
   --space-muted: var(--dim);
   --space-border: var(--border);
   --space-accent: var(--accent);
+  font-family:
+    "Hiragino Kaku Gothic ProN", "Hiragino Sans", "Noto Sans JP",
+    "Yu Gothic UI", "Yu Gothic", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 店名などの見出し用：明朝系で凛とした印象に */
+.font-display {
+  font-family:
+    "Hiragino Mincho ProN", "Hiragino Mincho Pro", "YuMincho", "Yu Mincho",
+    "Noto Serif JP", serif;
+  letter-spacing: 0.05em;
+}
+
+/* カレンダーの数字は等幅寄りで揃える */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* ---------- カラーテーマ（data-theme 属性で切り替え） ----------
+   公開カレンダーと編集画面の両方に反映される。配色は店主が選ぶ。
+   [data-theme] は :root の後に置き、ダークモードの :root 上書きより
+   優先させる（お店のテーマがブランドとして常に優先）。 */
+
+[data-theme="standard"] {
+  --bg: #f6f3ec;
+  --surface: #fffdf8;
+  --surface-alt: #efe9dc;
+  --text: #23272e;
+  --dim: #5d6470;
+  --border: #ddd3c2;
+  --accent: #1f3350;
+  --accent-text: #ffffff;
+  --accent-soft: #e6ebf2;
+  --closed: #b3402f;
+  --closed-bg: #f7e9e4;
+  --open: #2e7d4f;
+}
+
+[data-theme="warm"] {
+  --bg: #faf2e9;
+  --surface: #fffaf3;
+  --surface-alt: #f3e4d3;
+  --text: #33261d;
+  --dim: #7a6653;
+  --border: #e5d0b8;
+  --accent: #a84e28;
+  --accent-text: #ffffff;
+  --accent-soft: #f8e2cf;
+  --closed: #9c3a24;
+  --closed-bg: #f9e6da;
+  --open: #5d7d2e;
+}
+
+[data-theme="sakura"] {
+  --bg: #fdf3f4;
+  --surface: #fffafa;
+  --surface-alt: #fbe7ea;
+  --text: #38262c;
+  --dim: #85646f;
+  --border: #f0d0d9;
+  --accent: #b84f6e;
+  --accent-text: #ffffff;
+  --accent-soft: #f9e0e7;
+  --closed: #a8402f;
+  --closed-bg: #faeae6;
+  --open: #3d7d5a;
+}
+
+[data-theme="forest"] {
+  --bg: #f1f5ef;
+  --surface: #fbfdfb;
+  --surface-alt: #e1ecdd;
+  --text: #22302a;
+  --dim: #5c6d62;
+  --border: #ccdcC7;
+  --accent: #2e6b4f;
+  --accent-text: #ffffff;
+  --accent-soft: #ddefe0;
+  --closed: #b3402f;
+  --closed-bg: #f6e9e2;
+  --open: #2e7d4f;
+}
+
+[data-theme="ocean"] {
+  --bg: #eef4f9;
+  --surface: #fbfdfe;
+  --surface-alt: #dde9f2;
+  --text: #1f2c38;
+  --dim: #5a6d7d;
+  --border: #c7d9e8;
+  --accent: #1565a0;
+  --accent-text: #ffffff;
+  --accent-soft: #d9ecf7;
+  --closed: #b3402f;
+  --closed-bg: #f7e9e4;
+  --open: #2e7d6b;
+}
+
+[data-theme="mono"] {
+  --bg: #f3f3f4;
+  --surface: #ffffff;
+  --surface-alt: #e8e8ea;
+  --text: #232326;
+  --dim: #63636b;
+  --border: #d8d8dd;
+  --accent: #26262c;
+  --accent-text: #ffffff;
+  --accent-soft: #e6e6ea;
+  --closed: #b3402f;
+  --closed-bg: #f7e9e4;
+  --open: #3d7d4f;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -49,7 +165,9 @@
     --border: #3a3f4a;
     --accent: #7ea4d8;
     --accent-text: #101623;
-    --red: #e0806f;
-    --green: #6fc493;
+    --accent-soft: #2c3646;
+    --closed: #e0806f;
+    --closed-bg: #3a2a26;
+    --open: #6fc493;
   }
 }
