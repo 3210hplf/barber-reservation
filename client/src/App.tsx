@@ -111,6 +111,18 @@ function relativeUpdated(iso: string | null, today: string): string | null {
   return `${datePart} 更新`;
 }
 
+// 店名見出しのフォントサイズを文字数に応じて段階的に選ぶ。長い店名でも
+// 最後の1文字だけが2行目に落ちて間延びしないよう、併せて text-balance
+// で改行位置を均等にする（見出し側で指定）。
+// sizes は [短い, やや長い, 長い, とても長い] の順のクラス名。
+function nameHeadingClass(name: string, sizes: [string, string, string, string]): string {
+  const len = Array.from(name).length;
+  if (len <= 8) return sizes[0];
+  if (len <= 12) return sizes[1];
+  if (len <= 16) return sizes[2];
+  return sizes[3];
+}
+
 // ---------- shared UI ----------
 
 const THEME_OPTIONS: { key: string; label: string; accent: string; bg: string }[] = [
@@ -456,7 +468,9 @@ function PublicCalendarPage(props: { slug: string }) {
           >
             営業日カレンダー
           </p>
-          <h1 className="font-display mt-4 text-4xl leading-snug font-bold break-words">
+          <h1
+            className={`font-display mt-4 leading-snug font-bold break-words text-balance ${nameHeadingClass(shop.name, ["text-4xl", "text-3xl", "text-2xl", "text-xl"])}`}
+          >
             {shop.name}
           </h1>
           <div className="mt-6 flex justify-center">
@@ -1148,7 +1162,11 @@ function EditPage(props: { slug: string }) {
           <p className="text-xs font-semibold tracking-[0.35em]" style={{ color: "var(--dim)" }}>
             カレンダーの編集
           </p>
-          <h1 className="font-display mt-3 text-3xl font-bold break-words">{shop.name}</h1>
+          <h1
+            className={`font-display mt-3 font-bold break-words text-balance ${nameHeadingClass(shop.name, ["text-3xl", "text-2xl", "text-xl", "text-lg"])}`}
+          >
+            {shop.name}
+          </h1>
           <a
             href={`/${props.slug}`}
             className="mt-3 inline-block text-sm underline underline-offset-4"
