@@ -45,7 +45,9 @@ type ShopRow = typeof schema.shops.$inferSelect;
 // runs in both environments. An empty stored hash means "no password
 // set" (login impossible). There is no known default password anywhere.
 
-const PASSWORD_ITERATIONS = 120000;
+// Cloudflare Workers (workerd) WebCrypto rejects PBKDF2 iteration counts
+// above 100000, so this must stay at or below 100000.
+const PASSWORD_ITERATIONS = 100000;
 
 function toB64(bytes: Uint8Array): string {
   let bin = "";
@@ -340,7 +342,7 @@ async function monthOverrides(ctx: Ctx, shopId: number, yearMonth: string) {
 
 // ---------- admin helpers ----------
 
-const ADMIN_PASSWORD_ITERATIONS = 120000;
+const ADMIN_PASSWORD_ITERATIONS = 100000;
 
 type AdminRow = typeof schema.adminSettings.$inferSelect;
 
