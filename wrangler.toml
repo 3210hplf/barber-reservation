@@ -16,6 +16,6 @@ not_found_handling = "single-page-application"
 [[d1_databases]]
 binding = "DB"
 database_name = "barber-db"
-# TODO: replace with the real id printed by `wrangler d1 create barber-db`
-database_id = "00000000-0000-0000-0000-000000000000"
+# Real D1 database id for barber-db (created in the owner's Cloudflare account).
+database_id = "136a422f-ef9b-461d-b324-878a5c65ad65"
 migrations_dir = "migrations"
